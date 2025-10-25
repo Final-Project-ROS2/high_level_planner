@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc 
+*.pyd 
+*.pyo
+venv/
+.venv/
+env/
+.env/
+.env 
+build/
+dist/
+*.egg-info/
+
+# ROS2 specific
+install/
+log/
+build/
+*.cmake
+*.manifest
+*.d 
+*.o 
+
+# Editor/IDE specific
+.vscode/
+.idea/
+*.swp
+*.bak
+*~
+
+# Other common ignores
+.DS_Store
