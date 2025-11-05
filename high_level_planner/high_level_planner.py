@@ -51,7 +51,7 @@ class Ros2HighLevelAgentNode(Node):
         self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0.0)
 
         # Subscribe to transcript topic (MUST)
-        self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10)
+        # self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10)
         self._last_transcript_lock = threading.Lock()
         self._last_transcript: Optional[str] = None
 
