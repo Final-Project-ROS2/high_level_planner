@@ -61,10 +61,10 @@ class Ros2HighLevelAgentNode(Node):
         # For diagnostics & optional low-level services
         # (we declare vision service clients — replace types with your actual types)
         # These are placeholders for your vision node; implement/replace with actual srv/action types.
-        self.vision_detect_client = self.create_client(SetBool, "/vision/detect_objects")  # placeholder
-        self.vision_segment_client = self.create_client(SetBool, "/vision/segment_object")  # placeholder
-        self.vision_classify_client = self.create_client(SetBool, "/vision/classify_region")  # placeholder
-        self.vision_depth_client = self.create_client(SetBool, "/vision/get_depth_at_pixel")  # placeholder
+        # self.vision_detect_client = self.create_client(SetBool, "/vision/detect_objects")  # placeholder
+        # self.vision_segment_client = self.create_client(SetBool, "/vision/segment_object")  # placeholder
+        # self.vision_classify_client = self.create_client(SetBool, "/vision/classify_region")  # placeholder
+        # self.vision_depth_client = self.create_client(SetBool, "/vision/get_depth_at_pixel")  # placeholder
 
         # Track tools called (for feedback)
         self._tools_called: List[str] = []
