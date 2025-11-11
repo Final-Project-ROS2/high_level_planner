@@ -87,7 +87,7 @@ class Ros2HighLevelAgentNode(Node):
         self.vision_classify_bb_client = self.create_client(ClassifyBBox, "/vision/classify_bb")
         self.vision_detect_grasp_client = self.create_client(DetectGrasps, "/vision/detect_grasp")
         self.vision_detect_grasp_bb_client = self.create_client(DetectGraspBBox, "/vision/detect_grasp_bb")
-        self.vision_understand_scene_client = self.create_client(UnderstandScene, "/vision/understand_scene")
+        self.vision_understand_scene_client = self.create_client(Trigger, "/vision/understand_scene")
 
         # Track tools called (for feedback)
         self._tools_called: List[str] = []
@@ -421,12 +421,14 @@ class Ros2HighLevelAgentNode(Node):
                     return "No response from /vision/understand_scene"
                 if not resp.success:
                     return f"understand_scene failed: {resp.error_message or 'unknown'}"
-                summary = getattr(resp.scene, "scene_description", None)
-                if summary:
-                    return f"scene_summary: {summary}"
-                total_objects = getattr(resp.scene, "total_objects", None)
-                labels = getattr(resp.scene, "object_labels", None)
-                return f"scene_summary: total_objects={total_objects}, labels={labels}"
+                summary = resp.message or "no summary"
+                return f"Scene summary: {summary}"
+                # summary = getattr(resp.scene, "scene_description", None)
+                # if summary:
+                #     return f"scene_summary: {summary}"
+                # total_objects = getattr(resp.scene, "total_objects", None)
+                # labels = getattr(resp.scene, "object_labels", None)
+                # return f"scene_summary: total_objects={total_objects}, labels={labels}"
             except Exception as e:
                 return f"ERROR in understand_scene: {e}"
 
