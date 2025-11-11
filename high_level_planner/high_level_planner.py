@@ -13,6 +13,10 @@ Vision services exposed to the agent:
 - /vision/understand_scene  -> custom_interfaces.srv.UnderstandScene
 
 """
+import contextlib
+import io
+import sys
+
 import os
 import threading
 import time
@@ -46,8 +50,95 @@ from langchain.agents import AgentExecutor, create_tool_calling_agent
 
 from dotenv import load_dotenv
 
+import re
+import json
+
+def clean_agent_text(text: str) -> str:
+    """Clean and humanize raw AI agent log text for TTS."""
+    if not text:
+        return ""
+
+    # 1. Remove ANSI escape codes (color/style control chars)
+    text = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
+
+    # 2. Remove retry/error messages or technical logs
+    technical_patterns = [
+        r"Retrying .* in \d+(\.\d+)? seconds.*",
+        r"> Entering new AgentExecutor chain.*",
+        r"> Finished chain.*",
+        r"langchain.*",
+        r"InternalServe.*",
+    ]
+    for pattern in technical_patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+
+    text = text.strip()
+    if not text:
+        return ""
+
+    # 3. Handle structured invocation logs
+    # Example: Invoking: `send_to_medium_level` with `{'step_text': 'open the gripper'}`
+    invoke_match = re.search(
+        r"Invoking:\s*`send_to_medium_level`\s*with\s*`({.*})`", text)
+    if invoke_match:
+        try:
+            params_str = invoke_match.group(1)
+            # fix malformed single quotes and normalize JSON
+            params_str = params_str.replace("''", '"').replace("'", '"')
+            params = json.loads(params_str)
+            step_text = params.get("step_text", "").strip()
+            if step_text:
+                # Remove "Action:" prefix if present
+                step_text = re.sub(r'^[Aa]ction:\s*', '', step_text)
+                # Remove wrapping quotes if any remain
+                step_text = step_text.strip(" '\"")
+                return f"I'm going to {step_text}."
+        except Exception:
+            pass
+        return ""  # if malformed or unknown, drop it
+
+
+    # 4. Filter out medium_level result lines
+    # e.g. medium_level result: success=True, response=The gripper is now open.
+    if text.lower().startswith("medium_level result:"):
+        return ""
+
+    # 5. Convert JSON/dict-like text to human-friendly sentences
+    try:
+        if text.strip().startswith("{") and text.strip().endswith("}"):
+            data = json.loads(text)
+            parts = [f"{k.replace('_', ' ')} is {v}" for k, v in data.items()]
+            text = ". ".join(parts)
+    except Exception:
+        pass
+
+    # 6. Remove stray escape sequences, quotes, and collapse whitespace
+    text = text.replace("\\n", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip(" '\"")
+
+    # 7. Filter short/meaningless fragments
+    if len(text) < 3 or text.lower() in ["none", "null"]:
+        return ""
+
+    return text.strip()
+
+
+
 ENV_PATH = '/home/group11/final_project_ws/src/high_level_planner/.env'
 load_dotenv(dotenv_path=ENV_PATH)
+
+class ROSLogPublisher(io.TextIOBase):
+    def __init__(self, publisher):
+        self.publisher = publisher
+
+    def write(self, text):
+        text = clean_agent_text(text)
+        if text:
+            self.publisher.publish(String(data=text))
+        return len(text)
+
+    def flush(self):
+        pass
 
 
 class Ros2HighLevelAgentNode(Node):
@@ -143,53 +234,28 @@ class Ros2HighLevelAgentNode(Node):
             self._tools_called = []
 
         try:
-            self.get_logger().info("High-level agent: breaking instruction into ordered steps...")
-            self.response_pub.publish(String(data="Hey there! I'm thinking about how to handle your request..."))
+                self.get_logger().info("High-level agent: breaking instruction into ordered steps...")
+                self.response_pub.publish(String(data="Hey there! I'm thinking about how to handle your request..."))
 
-            agent_resp = self.agent_executor.invoke({"input": instruction_text})
-            # agent_resp commonly has "output" key (LangChain pattern)
-            final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
-            self.get_logger().info(f"Agent final text:\n{final_text}")
-            # Publish LLM response to /response
-            self.response_pub.publish(String(data=f"Alright! Here's what I plan to do: {final_text}"))
+                # Intercept stdout/stderr live
+                old_stdout, old_stderr = sys.stdout, sys.stderr
+                sys.stdout = sys.stderr = ROSLogPublisher(self.response_pub)
 
+                try:
+                    agent_resp = self.agent_executor.invoke({"input": prompt_text})
+                finally:
+                    sys.stdout, sys.stderr = old_stdout, old_stderr
 
-            # The LLM should produce ordered steps. We'll attempt to parse them.
-            steps = self._parse_steps_from_text(final_text)
-            if not steps:
-                self.get_logger().warn("No steps parsed from LLM response. Aborting dispatch.")
-                self.response_pub.publish(String(data="Hmm... I couldn’t figure out any clear steps. Could you try rephrasing that?"))
-                return
-
-            self.get_logger().info(f"Parsed {len(steps)} step(s). Dispatching to /medium_level one-by-one...")
-            self.response_pub.publish(String(data=f"I’ve got {len(steps)} steps to do. Let’s get started!"))
-
-            for i, step in enumerate(steps, start=1):
-                start_msg = f"Okay! Starting step {i}: {step}"
-                self.response_pub.publish(String(data=start_msg))
-
-                self.get_logger().info(f"Sending step {i}/{len(steps)} to medium_level: {step}")
-                result = self.send_step_to_medium(step)
-
-                if result is None:
-                    fail_msg = f"Oops! I couldn’t complete step {i}: {step}. I’ll stop here for now."
-                    self.response_pub.publish(String(data=fail_msg))
-                    self.get_logger().error(f"Failed to send step {i}. Aborting remaining steps.")
-                    break
-                else:
-                    if result.success:
-                        done_msg = f"Nice! Step {i} is all done. Here’s what I got: {result.final_response}"
-                    else:
-                        done_msg = f"Alright, I tried step {i} but it didn’t quite work out. The system said: {result.final_response}"
-                    self.response_pub.publish(String(data=done_msg))
-                    self.get_logger().info(f"Step {i} finished with success={result.success}. Response: {result.final_response}")
-
-            self.get_logger().info("Dispatch complete.")
-            self.response_pub.publish(String(data="All steps completed! Great teamwork!"))
+                final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
+                result_container["success"] = True
+                result_container["final_response"] = final_text
+                self.response_pub.publish(String(data=f"Done, {final_text}"))
 
         except Exception as e:
-            self.get_logger().error(f"Error during planning/dispatch: {e}")
-            self.response_pub.publish(String(data="Uh oh, something went wrong while I was planning that."))
+                self.get_logger().error(f"Error during planning/dispatch: {e}")
+                self.response_pub.publish(String(data="Uh oh, something went wrong while I was planning that."))
+                result_container["success"] = False
+                result_container["final_response"] = f"Agent error: {e}"
 
     def _parse_steps_from_text(self, text: str) -> List[str]:
         """
@@ -527,58 +593,26 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().info("High-level agent: breaking instruction into ordered steps...")
                 self.response_pub.publish(String(data="Hey there! I'm thinking about how to handle your request..."))
 
-                agent_resp = self.agent_executor.invoke({"input": prompt_text})
+                # Intercept stdout/stderr live
+                old_stdout, old_stderr = sys.stdout, sys.stderr
+                sys.stdout = sys.stderr = ROSLogPublisher(self.response_pub)
+
+                try:
+                    agent_resp = self.agent_executor.invoke({"input": prompt_text})
+                finally:
+                    sys.stdout, sys.stderr = old_stdout, old_stderr
+
                 final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
                 result_container["success"] = True
                 result_container["final_response"] = final_text
-                # Publish LLM response to /response
-                self.response_pub.publish(String(data=f"Alright! Here's what I plan to do: {final_text}"))
-
-                # Parse steps and dispatch
-                steps = self._parse_steps_from_text(final_text)
-                if not steps:
-                    result_container["final_response"] += "\n[No steps parsed]"
-                    self.response_pub.publish(String(data="Hmm... I couldn’t figure out any clear steps. Could you try rephrasing that?"))
-                    return
-
-                self.get_logger().info(f"Parsed {len(steps)} step(s). Dispatching to /medium_level one-by-one...")
-                self.response_pub.publish(String(data=f"I’ve got {len(steps)} steps to do. Let’s get started!"))
-
-                for i, step in enumerate(steps, start=1):
-                    start_msg = f"Okay! Starting step {i}: {step}"
-                    self.response_pub.publish(String(data=start_msg))
-
-                    self.get_logger().info(f"Sending step {i}/{len(steps)} to medium_level: {step}")
-                    # publish feedback with tools called snapshot
-                    with self._tools_called_lock:
-                        tools_snapshot = list(self._tools_called)
-                    feedback_msg.tools_called = tools_snapshot
-                    try:
-                        goal_handle.publish_feedback(feedback_msg)
-                    except Exception:
-                        pass
-
-                    # send step and wait
-                    # send_future = self.medium_level_client.wait_for_server(timeout_sec=5.0)
-                    send_result = self.send_step_to_medium_and_return_result_obj(step)
-                    if send_result is None:
-                        fail_msg = f"Oops! I couldn’t complete step {i}: {step}. I’ll stop here for now."
-                        self.response_pub.publish(String(data=fail_msg))
-                        result_container["final_response"] += f"\nStep {i} failed to start"
-                        break
-                    else:
-                        if send_result.success:
-                            done_msg = f"Nice! Step {i} is all done. Here’s what I got: {send_result.final_response}"
-                        else:
-                            done_msg = f"Alright, I tried step {i} but it didn’t quite work out. The system said: {send_result.final_response}"
-                        self.response_pub.publish(String(data=done_msg))
-                        result_container["final_response"] += f"\nStep {i} result: success={send_result.success}"
+                self.response_pub.publish(String(data=f"Done, {final_text}"))
 
             except Exception as e:
                 self.get_logger().error(f"Error during planning/dispatch: {e}")
                 self.response_pub.publish(String(data="Uh oh, something went wrong while I was planning that."))
                 result_container["success"] = False
                 result_container["final_response"] = f"Agent error: {e}"
+
 
         agent_thread = threading.Thread(target=run_agent_action, daemon=True)
         agent_thread.start()
