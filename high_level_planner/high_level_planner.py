@@ -198,7 +198,7 @@ class Ros2HighLevelAgentNode(Node):
         self.last_plan: Optional[List[str]] = None
 
         # Create a new service for confirmation
-        self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_callback)
+        self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
 
         # Action server to accept high-level Prompt requests
         self._action_server = ActionServer(
