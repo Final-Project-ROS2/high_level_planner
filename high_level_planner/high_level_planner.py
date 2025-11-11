@@ -26,7 +26,7 @@ from geometry_msgs.msg import Pose
 from custom_interfaces.action import Prompt
 
 # Vision service types (assumes these exist in your workspace)
-from custom_interfaces.srv import UnderstandScene
+# from custom_interfaces.srv import UnderstandScene
 
 # LangChain
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -73,7 +73,7 @@ class Ros2HighLevelAgentNode(Node):
 
         # Vision service clients - real types from your specification
         self.vision_classify_all_client = self.create_client(Trigger, "/vision/classify_all")
-        self.vision_understand_scene_client = self.create_client(UnderstandScene, "/vision/understand_scene")
+        self.vision_understand_scene_client = self.create_client(Trigger, "/vision/understand_scene")
 
         # Track tools called (for feedback)
         self._tools_called: List[str] = []
@@ -252,9 +252,9 @@ class Ros2HighLevelAgentNode(Node):
             with self._tools_called_lock:
                 self._tools_called.append(tool_name)
             try:
-                if not self.vision_understand_scene_client.wait_for_service(timeout_sec=5.0):
+                if not self.vision_understand_scene_client.wait_for_service(timeout_sec=10.0):
                     return "Service /vision/understand_scene unavailable"
-                req = UnderstandScene.Request()
+                req = Trigger.Request()
                 future = self.vision_understand_scene_client.call_async(req)
                 rclpy.spin_until_future_complete(self, future)
                 resp = future.result()
@@ -262,12 +262,14 @@ class Ros2HighLevelAgentNode(Node):
                     return "No response from /vision/understand_scene"
                 if not resp.success:
                     return f"understand_scene failed: {resp.error_message or 'unknown'}"
-                summary = getattr(resp.scene, "scene_description", None)
-                if summary:
-                    return f"scene_summary: {summary}"
-                total_objects = getattr(resp.scene, "total_objects", None)
-                labels = getattr(resp.scene, "object_labels", None)
-                return f"scene_summary: total_objects={total_objects}, labels={labels}"
+                scene_understanding = resp.message  # assuming message contains the scene understanding summary
+                return f"scene_understanding: {scene_understanding}"
+                # summary = getattr(resp.scene, "scene_description", None)
+                # if summary:
+                #     return f"scene_summary: {summary}"
+                # total_objects = getattr(resp.scene, "total_objects", None)
+                # labels = getattr(resp.scene, "object_labels", None)
+                # return f"scene_summary: total_objects={total_objects}, labels={labels}"
             except Exception as e:
                 return f"ERROR in understand_scene: {e}"
 
