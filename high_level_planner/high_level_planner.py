@@ -47,6 +47,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
 from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.messages import HumanMessage, AIMessage
 
 from dotenv import load_dotenv
 
@@ -246,8 +247,19 @@ class Ros2HighLevelAgentNode(Node):
         try:
             self.get_logger().info("High-level agent: thinking and generating plan...")
             self.response_pub.publish(String(data="Got it! Let me think through that..."))
-
-            agent_resp = self.agent_executor.invoke({"input": instruction_text})
+        
+            langchain_history = []
+            for msg in self.chat_history[:-1]:  # Exclude the current message we just added
+                if msg["role"] == "user":
+                    langchain_history.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    langchain_history.append(AIMessage(content=msg["content"]))
+            # Invoke agent with chat history
+            agent_resp = self.agent_executor.invoke({
+                "input": instruction_text,
+                "chat_history": langchain_history
+            })
+        
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
 
             # Add AI response to chat history
@@ -257,7 +269,7 @@ class Ros2HighLevelAgentNode(Node):
             steps = self._parse_steps_from_text(final_text)
             self.latest_plan = steps  # store latest plan
             if not steps:
-                msg = "Hmm... I couldn’t figure out any clear steps. Could you try rephrasing that?"
+                msg = "Hmm... I couldn't figure out any clear steps. Could you try rephrasing that?"
                 self.response_pub.publish(String(data=msg))
                 return []
 
@@ -272,7 +284,6 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().error(f"Error generating plan: {e}")
             self.response_pub.publish(String(data="Sorry, something went wrong while planning."))
             return []
-
 
     def _plan_and_dispatch_from_transcript(self, instruction_text: str):
         """
