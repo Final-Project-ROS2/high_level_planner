@@ -550,6 +550,7 @@ class Ros2HighLevelAgentNode(Node):
             "Your job: given a natural-language instruction, produce a short ordered list of actionable steps "
             "that a medium-level planner can execute. Keep steps concise, unambiguous and in the form "
             "'Action: <verb> <object/pose/params>'. Then, one by one, send each step to the medium-level planner "
+            "The robot has 2 setpoints: 'home' and 'ready'. Use these names when referring to them. "
             "When appropriate you may call vision tools to inspect the scene. "
             "For bbox-based tools provide integer pixel coordinates x1,y1,x2,y2. Return the final step list as the agent output."
         )
