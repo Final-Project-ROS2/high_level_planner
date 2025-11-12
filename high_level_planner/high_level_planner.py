@@ -47,6 +47,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
 from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.messages import HumanMessage, AIMessage
 
 from dotenv import load_dotenv
 
@@ -192,6 +193,13 @@ class Ros2HighLevelAgentNode(Node):
         # Create LangChain agent similar to medium-level
         self.agent_executor = self._create_agent_executor()
 
+        # Chat history
+        self.chat_history: List[Dict[str, str]] = []  # [{'role': 'user', 'content': ...}, {'role': 'ai', 'content': ...}]
+        self.latest_plan: Optional[List[str]] = None
+
+        # Create a new service for confirmation
+        self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
+
         # Action server to accept high-level Prompt requests
         self._action_server = ActionServer(
             self,
@@ -228,37 +236,104 @@ class Ros2HighLevelAgentNode(Node):
         plan_thread = threading.Thread(target=self._plan_and_dispatch_from_transcript, args=(text,), daemon=True)
         plan_thread.start()
 
+    def _generate_plan(self, instruction_text: str) -> List[str]:
+        """
+        Generate a plan (list of steps) from the user's instruction but do NOT execute.
+        The plan is stored internally for later confirmation.
+        """
+        # Add user message to chat history
+        self.chat_history.append({"role": "user", "content": instruction_text})
+
+        try:
+            self.get_logger().info("High-level agent: thinking and generating plan...")
+            self.response_pub.publish(String(data="Got it! Let me think through that..."))
+        
+            langchain_history = []
+            for msg in self.chat_history[:-1]:  # Exclude the current message we just added
+                if msg["role"] == "user":
+                    langchain_history.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    langchain_history.append(AIMessage(content=msg["content"]))
+            # Invoke agent with chat history
+            agent_resp = self.agent_executor.invoke({
+                "input": instruction_text,
+                "chat_history": langchain_history
+            })
+        
+            final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
+
+            # Add AI response to chat history
+            self.chat_history.append({"role": "assistant", "content": final_text})
+
+            # Parse steps
+            steps = self._parse_steps_from_text(final_text)
+            self.latest_plan = steps  # store latest plan
+            if not steps:
+                msg = "Hmm... I couldn't figure out any clear steps. Could you try rephrasing that?"
+                self.response_pub.publish(String(data=msg))
+                return []
+
+            # Present plan to user for confirmation
+            readable_plan = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps)])
+            self.response_pub.publish(String(
+                data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
+            ))
+            self.get_logger().info(f"Generated plan with {len(steps)} steps, waiting for /confirm.")
+            return steps
+        except Exception as e:
+            self.get_logger().error(f"Error generating plan: {e}")
+            self.response_pub.publish(String(data="Sorry, something went wrong while planning."))
+            return []
+
     def _plan_and_dispatch_from_transcript(self, instruction_text: str):
         """
         Use agent to break down instruction_text into steps and dispatch them to /medium_level
         """
-        # reset tools called
-        with self._tools_called_lock:
-            self._tools_called = []
+        self._generate_plan(instruction_text)
 
-        try:
-                self.get_logger().info("High-level agent: breaking instruction into ordered steps...")
-                self.response_pub.publish(String(data="Hey there! I'm thinking about how to handle your request..."))
+    def confirm_service_callback(self, request, response):
+        """
+        When the user confirms, execute the latest plan step-by-step.
+        Clears chat history and latest plan after execution.
+        """
+        if not self.latest_plan:
+            response.success = False
+            response.message = "No plan to confirm. Please give a new instruction first."
+            self.response_pub.publish(String(data=response.message))
+            return response
 
-                # Intercept stdout/stderr live
-                old_stdout, old_stderr = sys.stdout, sys.stderr
-                sys.stdout = sys.stderr = ROSLogPublisher(self.response_pub)
+        # Execute the plan in a separate thread to avoid blocking the service callback
+        def execute_plan():
+            self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+            self.get_logger().info("Executing confirmed plan...")
 
-                try:
-                    agent_resp = self.agent_executor.invoke({"input": prompt_text})
-                finally:
-                    sys.stdout, sys.stderr = old_stdout, old_stderr
+            for i, step in enumerate(self.latest_plan, start=1):
+                self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
+                result = self.send_step_to_medium_async(step)
 
-                final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
-                result_container["success"] = True
-                result_container["final_response"] = final_text
-                self.response_pub.publish(String(data=f"Done, {final_text}"))
+                if result is None or not result.success:
+                    msg = f"Step {i} failed: {step}. Stopping execution."
+                    self.response_pub.publish(String(data=msg))
+                    self.get_logger().error(msg)
+                    break
+                else:
+                    done_msg = f"Step {i} completed successfully."
+                    self.response_pub.publish(String(data=done_msg))
+                    self.get_logger().info(done_msg)
 
-        except Exception as e:
-                self.get_logger().error(f"Error during planning/dispatch: {e}")
-                self.response_pub.publish(String(data="Uh oh, something went wrong while I was planning that."))
-                result_container["success"] = False
-                result_container["final_response"] = f"Agent error: {e}"
+            self.response_pub.publish(String(data="Plan execution finished."))
+            self.get_logger().info("All steps done. Clearing chat history and plan.")
+            self.chat_history.clear()
+            self.latest_plan.clear()
+
+        # Start execution in background thread
+        execution_thread = threading.Thread(target=execute_plan, daemon=True)
+        execution_thread.start()
+
+        # Return immediately from service call
+        response.success = True
+        response.message = "Plan execution started."
+        return response
 
     def _parse_steps_from_text(self, text: str) -> List[str]:
         """
@@ -503,40 +578,6 @@ class Ros2HighLevelAgentNode(Node):
 
         tools.append(understand_scene)
 
-        # ------------- Medium-level dispatch tool -------------
-        @tool
-        def send_to_medium_level(step_text: str, wait_for_result: bool = True) -> str:
-            """
-            Send a single textual step to the medium-level planner (/medium_level action server, Prompt action).
-            If wait_for_result is True, we wait for the medium-level response and return a short summary.
-            """
-            tool_name = "send_to_medium_level"
-            with self._tools_called_lock:
-                self._tools_called.append(tool_name)
-
-            try:
-                if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
-                    return "Medium-level action server /medium_level unavailable"
-                goal = Prompt.Goal()
-                goal.prompt = step_text
-                send_future = self.medium_level_client.send_goal_async(goal)
-                rclpy.spin_until_future_complete(self, send_future)
-                goal_handle = send_future.result()
-                if not goal_handle.accepted:
-                    return "Medium-level goal rejected"
-
-                if wait_for_result:
-                    result_future = goal_handle.get_result_async()
-                    rclpy.spin_until_future_complete(self, result_future)
-                    result = result_future.result().result
-                    return f"medium_level result: success={result.success}, response={result.final_response}"
-                else:
-                    return "Sent step to medium_level (not waiting for result)."
-            except Exception as e:
-                return f"ERROR in send_to_medium_level: {e}"
-
-        tools.append(send_to_medium_level)
-
         return tools
 
     # -----------------------
@@ -546,10 +587,9 @@ class Ros2HighLevelAgentNode(Node):
         system_message = (
             "You are a High-Level ROS2 planning assistant. You have access to tools that query vision "
             "capabilities (detect_objects, classify_all, classify_bb, detect_grasp, detect_grasp_bb, understand_scene) "
-            "and a tool send_to_medium_level which sends a single step to the medium-level planner (/medium_level). "
             "Your job: given a natural-language instruction, produce a short ordered list of actionable steps "
             "that a medium-level planner can execute. Keep steps concise, unambiguous and in the form "
-            "'Action: <verb> <object/pose/params>'. Then, one by one, send each step to the medium-level planner "
+            "'Action: <verb> <object/pose/params>'. "
             "The robot has 2 setpoints: 'home' and 'ready'. Use these names when referring to them. "
             "When appropriate you may call vision tools to inspect the scene. "
             "For bbox-based tools provide integer pixel coordinates x1,y1,x2,y2. Return the final step list as the agent output."
@@ -590,32 +630,27 @@ class Ros2HighLevelAgentNode(Node):
 
         feedback_msg = Prompt.Feedback()
 
-        result_container: Dict[str, Any] = {"success": False, "final_response": "Internal error"}
+        result_container: Dict[str, Any] = {"success": True, "final_response": "Internal error"}
 
         def run_agent_action():
-            try:
-                self.get_logger().info("High-level agent: breaking instruction into ordered steps...")
-                self.response_pub.publish(String(data="Hey there! I'm thinking about how to handle your request..."))
+                goal_text = goal_handle.request.prompt.strip()
+                if not goal_text:
+                    goal_handle.abort()
+                    return Prompt.Result(success=False, final_response="Empty prompt")
 
-                # Intercept stdout/stderr live
-                old_stdout, old_stderr = sys.stdout, sys.stderr
-                sys.stdout = sys.stderr = ROSLogPublisher(self.response_pub)
+                self.get_logger().info(f"High-level Prompt action received: {goal_text}")
+                # self.response_pub.publish(String(data=f"You said: {goal_text}"))
 
-                try:
-                    agent_resp = self.agent_executor.invoke({"input": prompt_text})
-                finally:
-                    sys.stdout, sys.stderr = old_stdout, old_stderr
+                # Generate plan but do not execute
+                steps = self._generate_plan(goal_text)
+                if not steps:
+                    goal_handle.abort()
+                    return Prompt.Result(success=False, final_response="Failed to generate plan")
 
-                final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
-                result_container["success"] = True
-                result_container["final_response"] = final_text
-                self.response_pub.publish(String(data=f"Done, {final_text}"))
-
-            except Exception as e:
-                self.get_logger().error(f"Error during planning/dispatch: {e}")
-                self.response_pub.publish(String(data="Uh oh, something went wrong while I was planning that."))
-                result_container["success"] = False
-                result_container["final_response"] = f"Agent error: {e}"
+                # Wait for confirmation
+                msg = f"Generated {len(steps)} step(s). Please review and confirm via /confirm to execute."
+                # self.response_pub.publish(String(data=msg))
+                return Prompt.Result(success=True, final_response=msg)
 
 
         agent_thread = threading.Thread(target=run_agent_action, daemon=True)
@@ -676,6 +711,64 @@ class Ros2HighLevelAgentNode(Node):
             rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout)
             result = result_future.result().result
             return result
+        except Exception as e:
+            self.get_logger().error(f"Exception when sending to medium: {e}")
+            return None
+
+    def send_step_to_medium_async(self, step_text: str, timeout: float = 30.0) -> Optional[Prompt.Result]:
+        """
+        Thread-safe version that uses threading.Event instead of spin_until_future_complete.
+        """
+        try:
+            if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
+                self.get_logger().error("/medium_level action server unavailable")
+                return None
+            
+            goal = Prompt.Goal()
+            goal.prompt = step_text
+            
+            # Use events to wait for async operations
+            goal_event = threading.Event()
+            result_event = threading.Event()
+            goal_handle_container = [None]
+            result_container = [None]
+            
+            # Callback for goal response
+            def goal_response_callback(future):
+                goal_handle_container[0] = future.result()
+                goal_event.set()
+            
+            # Callback for result
+            def result_callback(future):
+                result_container[0] = future.result()
+                result_event.set()
+            
+            # Send goal
+            send_future = self.medium_level_client.send_goal_async(goal)
+            send_future.add_done_callback(goal_response_callback)
+            
+            # Wait for goal acceptance
+            if not goal_event.wait(timeout=5.0):
+                self.get_logger().error("Timeout waiting for goal acceptance")
+                return None
+            
+            goal_handle = goal_handle_container[0]
+            if not goal_handle.accepted:
+                self.get_logger().error("Medium-level goal rejected")
+                return None
+            
+            # Get result
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(result_callback)
+            
+            # Wait for result
+            if not result_event.wait(timeout=timeout):
+                self.get_logger().error("Timeout waiting for result")
+                return None
+            
+            result = result_container[0].result
+            return result
+            
         except Exception as e:
             self.get_logger().error(f"Exception when sending to medium: {e}")
             return None
