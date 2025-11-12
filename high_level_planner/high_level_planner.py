@@ -165,7 +165,7 @@ class Ros2HighLevelAgentNode(Node):
         if not api_key:
             self.get_logger().warn("No LLM API key found in environment variables GEMINI_API_KEY.")
 
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0.0)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0.0)
 
         # Subscribe to transcript topic (MUST)
         self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10)
@@ -195,7 +195,7 @@ class Ros2HighLevelAgentNode(Node):
 
         # Chat history
         self.chat_history: List[Dict[str, str]] = []  # [{'role': 'user', 'content': ...}, {'role': 'ai', 'content': ...}]
-        self.last_plan: Optional[List[str]] = None
+        self.latest_plan: Optional[List[str]] = None
 
         # Create a new service for confirmation
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
@@ -276,7 +276,7 @@ class Ros2HighLevelAgentNode(Node):
             # Present plan to user for confirmation
             readable_plan = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps)])
             self.response_pub.publish(String(
-                data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and call /confirm if this looks good!"
+                data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
             ))
             self.get_logger().info(f"Generated plan with {len(steps)} steps, waiting for /confirm.")
             return steps
@@ -299,34 +299,41 @@ class Ros2HighLevelAgentNode(Node):
         if not self.latest_plan:
             response.success = False
             response.message = "No plan to confirm. Please give a new instruction first."
+            self.response_pub.publish(String(data=response.message))
             return response
 
-        self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
-        self.get_logger().info("Executing confirmed plan...")
+        # Execute the plan in a separate thread to avoid blocking the service callback
+        def execute_plan():
+            self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+            self.get_logger().info("Executing confirmed plan...")
 
-        for i, step in enumerate(self.latest_plan, start=1):
-            self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
-            result = self.send_step_to_medium(step)
+            for i, step in enumerate(self.latest_plan, start=1):
+                self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
+                result = self.send_step_to_medium_async(step)
 
-            if result is None or not result.success:
-                msg = f"Step {i} failed: {step}. Stopping execution."
-                self.response_pub.publish(String(data=msg))
-                self.get_logger().error(msg)
-                break
-            else:
-                done_msg = f"Step {i} completed successfully."
-                self.response_pub.publish(String(data=done_msg))
-                self.get_logger().info(done_msg)
+                if result is None or not result.success:
+                    msg = f"Step {i} failed: {step}. Stopping execution."
+                    self.response_pub.publish(String(data=msg))
+                    self.get_logger().error(msg)
+                    break
+                else:
+                    done_msg = f"Step {i} completed successfully."
+                    self.response_pub.publish(String(data=done_msg))
+                    self.get_logger().info(done_msg)
 
-        self.response_pub.publish(String(data="Plan execution finished."))
-        self.get_logger().info("All steps done. Clearing chat history and plan.")
-        self.chat_history.clear()
-        self.latest_plan.clear()
+            self.response_pub.publish(String(data="Plan execution finished."))
+            self.get_logger().info("All steps done. Clearing chat history and plan.")
+            self.chat_history.clear()
+            self.latest_plan.clear()
 
+        # Start execution in background thread
+        execution_thread = threading.Thread(target=execute_plan, daemon=True)
+        execution_thread.start()
+
+        # Return immediately from service call
         response.success = True
-        response.message = "Plan executed and cleared."
+        response.message = "Plan execution started."
         return response
-
 
     def _parse_steps_from_text(self, text: str) -> List[str]:
         """
@@ -623,7 +630,7 @@ class Ros2HighLevelAgentNode(Node):
 
         feedback_msg = Prompt.Feedback()
 
-        result_container: Dict[str, Any] = {"success": False, "final_response": "Internal error"}
+        result_container: Dict[str, Any] = {"success": True, "final_response": "Internal error"}
 
         def run_agent_action():
                 goal_text = goal_handle.request.prompt.strip()
@@ -632,7 +639,7 @@ class Ros2HighLevelAgentNode(Node):
                     return Prompt.Result(success=False, final_response="Empty prompt")
 
                 self.get_logger().info(f"High-level Prompt action received: {goal_text}")
-                self.response_pub.publish(String(data=f"You said: {goal_text}"))
+                # self.response_pub.publish(String(data=f"You said: {goal_text}"))
 
                 # Generate plan but do not execute
                 steps = self._generate_plan(goal_text)
@@ -642,7 +649,7 @@ class Ros2HighLevelAgentNode(Node):
 
                 # Wait for confirmation
                 msg = f"Generated {len(steps)} step(s). Please review and confirm via /confirm to execute."
-                self.response_pub.publish(String(data=msg))
+                # self.response_pub.publish(String(data=msg))
                 return Prompt.Result(success=True, final_response=msg)
 
 
@@ -704,6 +711,64 @@ class Ros2HighLevelAgentNode(Node):
             rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout)
             result = result_future.result().result
             return result
+        except Exception as e:
+            self.get_logger().error(f"Exception when sending to medium: {e}")
+            return None
+
+    def send_step_to_medium_async(self, step_text: str, timeout: float = 30.0) -> Optional[Prompt.Result]:
+        """
+        Thread-safe version that uses threading.Event instead of spin_until_future_complete.
+        """
+        try:
+            if not self.medium_level_client.wait_for_server(timeout_sec=5.0):
+                self.get_logger().error("/medium_level action server unavailable")
+                return None
+            
+            goal = Prompt.Goal()
+            goal.prompt = step_text
+            
+            # Use events to wait for async operations
+            goal_event = threading.Event()
+            result_event = threading.Event()
+            goal_handle_container = [None]
+            result_container = [None]
+            
+            # Callback for goal response
+            def goal_response_callback(future):
+                goal_handle_container[0] = future.result()
+                goal_event.set()
+            
+            # Callback for result
+            def result_callback(future):
+                result_container[0] = future.result()
+                result_event.set()
+            
+            # Send goal
+            send_future = self.medium_level_client.send_goal_async(goal)
+            send_future.add_done_callback(goal_response_callback)
+            
+            # Wait for goal acceptance
+            if not goal_event.wait(timeout=5.0):
+                self.get_logger().error("Timeout waiting for goal acceptance")
+                return None
+            
+            goal_handle = goal_handle_container[0]
+            if not goal_handle.accepted:
+                self.get_logger().error("Medium-level goal rejected")
+                return None
+            
+            # Get result
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(result_callback)
+            
+            # Wait for result
+            if not result_event.wait(timeout=timeout):
+                self.get_logger().error("Timeout waiting for result")
+                return None
+            
+            result = result_container[0].result
+            return result
+            
         except Exception as e:
             self.get_logger().error(f"Exception when sending to medium: {e}")
             return None
