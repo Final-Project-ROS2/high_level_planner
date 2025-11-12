@@ -165,7 +165,7 @@ class Ros2HighLevelAgentNode(Node):
         if not api_key:
             self.get_logger().warn("No LLM API key found in environment variables GEMINI_API_KEY.")
 
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0.0)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0.0)
 
         # Subscribe to transcript topic (MUST)
         self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10)
