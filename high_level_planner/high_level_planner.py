@@ -48,6 +48,8 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_ollama import ChatOllama
+
 
 from dotenv import load_dotenv
 
@@ -159,13 +161,31 @@ class Ros2HighLevelAgentNode(Node):
 
         self.declare_parameter("real_hardware", False)
         self.real_hardware: bool = self.get_parameter("real_hardware").get_parameter_value().bool_value
+        self.declare_parameter("use_ollama", False)
+        self.use_ollama: bool = self.get_parameter("use_ollama").get_parameter_value().bool_value
 
-        # LLM init
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            self.get_logger().warn("No LLM API key found in environment variables GEMINI_API_KEY.")
 
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0.0)
+        # -----------------------------
+        # LLM Selection: Gemini or Ollama
+        # -----------------------------
+        if self.use_ollama:
+            self.get_logger().info("Using local LLM via Ollama.")
+            # Example: using llama3.1 or any model installed in `ollama list`
+            self.llm = ChatOllama(
+                model="gpt-oss:20b",   # <--- change to any local model you want
+                temperature=0.0
+            )
+        else:
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                self.get_logger().warn("No LLM API key found in environment variables GEMINI_API_KEY.")
+            self.get_logger().info("Using Google Gemini API LLM.")
+            self.llm = ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash",
+                google_api_key=api_key,
+                temperature=0.0,
+            )
+
 
         # Subscribe to transcript topic (MUST)
         self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10)
