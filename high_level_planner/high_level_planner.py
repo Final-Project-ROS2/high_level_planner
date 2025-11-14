@@ -585,12 +585,13 @@ class Ros2HighLevelAgentNode(Node):
     # -----------------------
     def _create_agent_executor(self) -> AgentExecutor:
         system_message = (
-            "You are a High-Level ROS2 planning assistant. You have access to tools that query vision "
+            "You are a High-Level ROS2 planning assistant for a Robotic Arm. You have access to tools that query vision "
             "capabilities (detect_objects, classify_all, classify_bb, detect_grasp, detect_grasp_bb, understand_scene) "
             "Your job: given a natural-language instruction, produce a short ordered list of actionable steps "
             "that a medium-level planner can execute. Keep steps concise, unambiguous and in the form "
             "'Action: <verb> <object/pose/params>'. "
             "The robot has 2 setpoints: 'home' and 'ready'. Use these names when referring to them. "
+            "**ALWAYS** produce steps that can be executed by the medium-level planner. "
             "When appropriate you may call vision tools to inspect the scene. "
             "For bbox-based tools provide integer pixel coordinates x1,y1,x2,y2. Return the final step list as the agent output."
         )
