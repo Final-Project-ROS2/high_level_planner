@@ -11,6 +11,7 @@ Vision services exposed to the agent:
 - /vision/detect_grasp      -> custom_interfaces.srv.DetectGrasps
 - /vision/detect_grasp_bb   -> custom_interfaces.srv.DetectGraspBBox
 - /vision/understand_scene  -> custom_interfaces.srv.UnderstandScene
+- /vision/find_object       -> custom_interfaces.srv.FindObject
 
 """
 import contextlib
@@ -40,6 +41,7 @@ from custom_interfaces.srv import (
     DetectGrasps,
     DetectGraspBBox,
     UnderstandScene,
+    FindObject,
 )
 
 # LangChain
@@ -202,6 +204,7 @@ class Ros2HighLevelAgentNode(Node):
         self.vision_detect_grasp_client = self.create_client(DetectGrasps, "/vision/detect_grasp")
         self.vision_detect_grasp_bb_client = self.create_client(DetectGraspBBox, "/vision/detect_grasp_bb")
         self.vision_understand_scene_client = self.create_client(Trigger, "/vision/understand_scene")
+        self.vision_find_object_client = self.create_client(FindObject, "/vision/find_object")
 
         # Track tools called (for feedback)
         self._tools_called: List[str] = []
@@ -598,6 +601,35 @@ class Ros2HighLevelAgentNode(Node):
 
         tools.append(understand_scene)
 
+        @tool
+        def find_object(label: str) -> str:
+            """
+            Call /vision/find_object to locate an object by label.
+            Returns the bounding box and if found.
+            """
+            tool_name = "find_object"
+            with self._tools_called_lock:
+                self._tools_called.append(tool_name)
+            try:
+                if not self.vision_find_object_client.wait_for_service(timeout_sec=5.0):
+                    return "Service /vision/find_object unavailable"
+                req = FindObject.Request()
+                req.label = label
+                future = self.vision_find_object_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
+                resp = future.result()
+                if resp is None:
+                    return "No response from /vision/find_object"
+                if not resp.success:
+                    return f"find_object failed: {resp.error_message or 'unknown'}"
+                bbox = resp.bbox
+                msg = resp.message or ""
+                return f"find_object: label='{label}', bbox=[{bbox.x1},{bbox.y1},{bbox.x2},{bbox.y2}], message='{msg}'"
+            except Exception as e:
+                return f"ERROR in find_object: {e}"
+        
+        tools.append(find_object)
+
         return tools
 
     # -----------------------
@@ -606,7 +638,7 @@ class Ros2HighLevelAgentNode(Node):
     def _create_agent_executor(self) -> AgentExecutor:
         system_message = (
             "You are a High-Level ROS2 planning assistant for a Robotic Arm. You have access to tools that query vision "
-            "capabilities (detect_objects, classify_all, classify_bb, detect_grasp, detect_grasp_bb, understand_scene) "
+            "capabilities (detect_objects, classify_all, classify_bb, detect_grasp, detect_grasp_bb, understand_scene, find_object) "
             "Your job: given a natural-language instruction, produce a short ordered list of actionable steps "
             "that a medium-level planner can execute. Keep steps concise, unambiguous and in the form "
             "'Action: <verb> <object/pose/params>'. "
