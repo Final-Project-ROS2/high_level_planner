@@ -300,7 +300,37 @@ class Ros2HighLevelAgentNode(Node):
             self.response_pub.publish(String(
                 data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
             ))
-            self.get_logger().info(f"Generated plan with {len(steps)} steps, waiting for /confirm.")
+            if self.confirm:
+                self.get_logger().info(f"Generated plan with {len(steps)} steps, waiting for /confirm.")
+            else:
+                # Execute the plan in a separate thread to avoid blocking the service callback
+                def execute_plan():
+                    self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+                    self.get_logger().info("Executing confirmed plan...")
+
+                    for i, step in enumerate(self.latest_plan, start=1):
+                        self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
+                        result = self.send_step_to_medium_async(step)
+
+                        if result is None or not result.success:
+                            msg = f"Step {i} failed: {step}. Stopping execution."
+                            self.response_pub.publish(String(data=msg))
+                            self.get_logger().error(msg)
+                            break
+                        else:
+                            done_msg = f"Step {i} completed successfully."
+                            self.response_pub.publish(String(data=done_msg))
+                            self.get_logger().info(done_msg)
+
+                    self.response_pub.publish(String(data="Plan execution finished."))
+                    self.get_logger().info("All steps done. Clearing chat history and plan.")
+                    self.chat_history.clear()
+                    self.latest_plan.clear()
+
+                # Start execution in background thread
+                execution_thread = threading.Thread(target=execute_plan, daemon=True)
+                execution_thread.start()
+
             return steps
         except Exception as e:
             self.get_logger().error(f"Error generating plan: {e}")
@@ -673,34 +703,6 @@ class Ros2HighLevelAgentNode(Node):
                 if self.confirm:
                     # Wait for confirmation
                     msg = f"Generated {len(steps)} step(s). Please review and confirm via /confirm to execute."
-                else:
-                    # Execute the plan in a separate thread to avoid blocking the service callback
-                    def execute_plan():
-                        self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
-                        self.get_logger().info("Executing confirmed plan...")
-
-                        for i, step in enumerate(self.latest_plan, start=1):
-                            self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
-                            result = self.send_step_to_medium_async(step)
-
-                            if result is None or not result.success:
-                                msg = f"Step {i} failed: {step}. Stopping execution."
-                                self.response_pub.publish(String(data=msg))
-                                self.get_logger().error(msg)
-                                break
-                            else:
-                                done_msg = f"Step {i} completed successfully."
-                                self.response_pub.publish(String(data=done_msg))
-                                self.get_logger().info(done_msg)
-
-                        self.response_pub.publish(String(data="Plan execution finished."))
-                        self.get_logger().info("All steps done. Clearing chat history and plan.")
-                        self.chat_history.clear()
-                        self.latest_plan.clear()
-
-                    # Start execution in background thread
-                    execution_thread = threading.Thread(target=execute_plan, daemon=True)
-                    execution_thread.start()
 
                 # self.response_pub.publish(String(data=msg))
                 return Prompt.Result(success=True, final_response=msg)
