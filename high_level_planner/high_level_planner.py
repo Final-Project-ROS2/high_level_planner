@@ -163,6 +163,8 @@ class Ros2HighLevelAgentNode(Node):
         self.real_hardware: bool = self.get_parameter("real_hardware").get_parameter_value().bool_value
         self.declare_parameter("use_ollama", False)
         self.use_ollama: bool = self.get_parameter("use_ollama").get_parameter_value().bool_value
+        self.declare_parameter("confirm", True)
+        self.confirm: bool = self.get_parameter("confirm").get_parameter_value().bool_value 
 
 
         # -----------------------------
@@ -298,7 +300,40 @@ class Ros2HighLevelAgentNode(Node):
             self.response_pub.publish(String(
                 data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
             ))
-            self.get_logger().info(f"Generated plan with {len(steps)} steps, waiting for /confirm.")
+            if self.confirm:
+                self.get_logger().info(f"Generated plan with {len(steps)} steps, waiting for /confirm.")
+            else:
+                # Execute the plan in a separate thread to avoid blocking the service callback
+                def execute_plan():
+                    self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+                    self.get_logger().info("Executing confirmed plan...")
+
+                    for i, step in enumerate(self.latest_plan, start=1):
+                        self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
+                        result = self.send_step_to_medium_async(step)
+
+                        if result is None or not result.success:
+                            msg = f"Step {i} failed: {step}. Stopping execution."
+                            self.response_pub.publish(String(data=msg))
+                            self.get_logger().error(msg)
+                            break
+                        else:
+                            done_msg = f"Step {i} completed successfully."
+                            self.response_pub.publish(String(data=done_msg))
+                            self.get_logger().info(done_msg)
+
+                    end_time = time.perf_counter()
+                    benchmark_info = f"High-level action completed in {end_time - self.start_time:.2f} seconds"
+                    self.benchmark_pub.publish(String(data=benchmark_info))
+                    self.response_pub.publish(String(data="Plan execution finished."))
+                    self.get_logger().info("All steps done. Clearing chat history and plan.")
+                    self.chat_history.clear()
+                    self.latest_plan.clear()
+
+                # Start execution in background thread
+                execution_thread = threading.Thread(target=execute_plan, daemon=True)
+                execution_thread.start()
+
             return steps
         except Exception as e:
             self.get_logger().error(f"Error generating plan: {e}")
@@ -645,7 +680,7 @@ class Ros2HighLevelAgentNode(Node):
         """
         Handles the incoming Prompt action (high-level). Breaks prompt into steps and dispatches them.
         """
-        start_time = time.perf_counter()
+        self.start_time = time.perf_counter()
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
@@ -668,8 +703,10 @@ class Ros2HighLevelAgentNode(Node):
                     goal_handle.abort()
                     return Prompt.Result(success=False, final_response="Failed to generate plan")
 
-                # Wait for confirmation
-                msg = f"Generated {len(steps)} step(s). Please review and confirm via /confirm to execute."
+                if self.confirm:
+                    # Wait for confirmation
+                    msg = f"Generated {len(steps)} step(s). Please review and confirm via /confirm to execute."
+
                 # self.response_pub.publish(String(data=msg))
                 return Prompt.Result(success=True, final_response=msg)
 
@@ -703,9 +740,6 @@ class Ros2HighLevelAgentNode(Node):
 
         goal_handle.succeed()
         self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
-        end_time = time.perf_counter()
-        benchmark_info = f"High-level action completed in {end_time - start_time:.2f} seconds.\n Number of tools called: {len(tools_snapshot)}"
-        self.benchmark_pub.publish(String(data=benchmark_info))
         return result_msg
 
     # -----------------------
