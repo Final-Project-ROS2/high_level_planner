@@ -438,7 +438,7 @@ class Ros2HighLevelAgentNode(Node):
             except Exception as e:
                 return f"ERROR in detect_objects: {e}"
 
-        tools.append(detect_objects)
+        # tools.append(detect_objects)
 
         @tool
         def classify_all() -> str:
@@ -461,7 +461,7 @@ class Ros2HighLevelAgentNode(Node):
             except Exception as e:
                 return f"ERROR in classify_all: {e}"
 
-        tools.append(classify_all)
+        # tools.append(classify_all)
 
         @tool
         def classify_bb(x1: int, y1: int, x2: int, y2: int) -> str:
@@ -496,7 +496,7 @@ class Ros2HighLevelAgentNode(Node):
             except Exception as e:
                 return f"ERROR in classify_bb: {e}"
 
-        tools.append(classify_bb)
+        # tools.append(classify_bb)
 
         @tool
         def detect_grasp() -> str:
@@ -530,7 +530,7 @@ class Ros2HighLevelAgentNode(Node):
             except Exception as e:
                 return f"ERROR in detect_grasp: {e}"
 
-        tools.append(detect_grasp)
+        # tools.append(detect_grasp)
 
         @tool
         def detect_grasp_bb(x1: int, y1: int, x2: int, y2: int) -> str:
@@ -566,7 +566,7 @@ class Ros2HighLevelAgentNode(Node):
             except Exception as e:
                 return f"ERROR in detect_grasp_bb: {e}"
 
-        tools.append(detect_grasp_bb)
+        # tools.append(detect_grasp_bb)
 
         @tool
         def understand_scene() -> str:
@@ -599,7 +599,7 @@ class Ros2HighLevelAgentNode(Node):
             except Exception as e:
                 return f"ERROR in understand_scene: {e}"
 
-        tools.append(understand_scene)
+        # tools.append(understand_scene)
 
         @tool
         def find_object(label: str) -> str:
@@ -628,7 +628,7 @@ class Ros2HighLevelAgentNode(Node):
             except Exception as e:
                 return f"ERROR in find_object: {e}"
         
-        tools.append(find_object)
+        # tools.append(find_object)
 
         return tools
 
@@ -637,8 +637,9 @@ class Ros2HighLevelAgentNode(Node):
     # -----------------------
     def _create_agent_executor(self) -> AgentExecutor:
         system_message = (
-            "You are a High-Level ROS2 planning assistant for a Robotic Arm. You have access to tools that query vision "
-            "capabilities (detect_objects, classify_all, classify_bb, detect_grasp, detect_grasp_bb, understand_scene, find_object) "
+            "You are a High-Level ROS2 planning assistant for a Robotic Arm."
+            # "You are a High-Level ROS2 planning assistant for a Robotic Arm. You have access to tools that query vision "
+            # "capabilities (detect_objects, classify_all, classify_bb, detect_grasp, detect_grasp_bb, understand_scene, find_object) "
             "Your job: given a natural-language instruction, produce a short ordered list of actionable steps "
             "that a medium-level planner can execute. Keep steps concise, unambiguous and in the form "
             "'Action: <verb> <object/pose/params>'. "
