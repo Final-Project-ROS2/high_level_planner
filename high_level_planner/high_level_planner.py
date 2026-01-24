@@ -237,28 +237,37 @@ class Ros2HighLevelAgentNode(Node):
 
         self.get_logger().info("Ros2 High-Level Agent Node ready (listening /transcript, Prompt action server running).")
 
+    def _benchmark_log(self, label: str):
+        t = self.get_clock().now()
+        t_sec = t.nanoseconds * 1e-9
+        self.benchmark_pub.publish(
+            String(data=f"{label},{t_sec:.9f}")
+        )
+
     # -----------------------
     # Transcript handling
     # -----------------------
     def transcript_callback(self, msg: String):
-        """
-        Called whenever a new natural-language instruction arrives on /transcript.
-        We store the last transcript and start planning in a background thread.
-        """
         text = msg.data.strip()
         if not text:
             return
+
+        start_time = time.perf_counter()
+        self._benchmark_log("transcript_received")
 
         with self._last_transcript_lock:
             self._last_transcript = text
 
         self.get_logger().info(f"Received transcript: {text}")
 
-        # Run planning asynchronously (don't block the subscriber thread)
-        plan_thread = threading.Thread(target=self._plan_and_dispatch_from_transcript, args=(text,), daemon=True)
+        plan_thread = threading.Thread(
+            target=self._plan_and_dispatch_from_transcript,
+            args=(text, start_time),
+            daemon=True
+        )
         plan_thread.start()
 
-    def _generate_plan(self, instruction_text: str) -> List[str]:
+    def _generate_plan(self, instruction_text: str, start_time: Optional[float] = None) -> List[str]:
         """
         Generate a plan (list of steps) from the user's instruction but do NOT execute.
         The plan is stored internally for later confirmation.
@@ -289,7 +298,13 @@ class Ros2HighLevelAgentNode(Node):
 
             # Parse steps
             steps = self._parse_steps_from_text(final_text)
-            self.latest_plan = steps  # store latest plan
+            self.latest_plan = steps
+
+            if start_time is not None:
+                end_time = time.perf_counter()
+                self._benchmark_log("plan_generated")
+                self.benchmark_pub.publish(String(data=f"Plan generated in: ,{end_time - start_time:.2f}"))
+
             if not steps:
                 msg = "Hmm... I couldn't figure out any clear steps. Could you try rephrasing that?"
                 self.response_pub.publish(String(data=msg))
@@ -340,11 +355,8 @@ class Ros2HighLevelAgentNode(Node):
             self.response_pub.publish(String(data="Sorry, something went wrong while planning."))
             return []
 
-    def _plan_and_dispatch_from_transcript(self, instruction_text: str):
-        """
-        Use agent to break down instruction_text into steps and dispatch them to /medium_level
-        """
-        self._generate_plan(instruction_text)
+    def _plan_and_dispatch_from_transcript(self, instruction_text: str, start_time: float):
+        self._generate_plan(instruction_text, start_time=start_time)
 
     def confirm_service_callback(self, request, response):
         """
@@ -678,10 +690,9 @@ class Ros2HighLevelAgentNode(Node):
         return CancelResponse.ACCEPT
 
     async def execute_callback(self, goal_handle):
-        """
-        Handles the incoming Prompt action (high-level). Breaks prompt into steps and dispatches them.
-        """
-        self.start_time = time.perf_counter()
+        start_time = time.perf_counter()
+        self._benchmark_log("action_goal_received")
+
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
@@ -699,7 +710,7 @@ class Ros2HighLevelAgentNode(Node):
                 # self.response_pub.publish(String(data=f"You said: {goal_text}"))
 
                 # Generate plan but do not execute
-                steps = self._generate_plan(goal_text)
+                steps = self._generate_plan(goal_text, start_time=start_time)
                 if not steps:
                     goal_handle.abort()
                     return Prompt.Result(success=False, final_response="Failed to generate plan")
