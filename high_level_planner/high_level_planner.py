@@ -660,8 +660,8 @@ class Ros2HighLevelAgentNode(Node):
             "The robot has 2 setpoints: 'home' and 'ready'. Use these names when referring to them. "
             "The medium-level planner can handle commands like 'move to <setpoint>', 'move to <object>', 'move <direction>', 'pick <object_id>', 'place at <location>', "
             "**ALWAYS** produce steps that can be executed by the medium-level planner. "
-            "When appropriate you may call vision tools to inspect the scene. "
-            "For bbox-based tools provide integer pixel coordinates x1,y1,x2,y2. Return the final step list as the agent output."
+            # "When appropriate you may call vision tools to inspect the scene. "
+            # "For bbox-based tools provide integer pixel coordinates x1,y1,x2,y2. Return the final step list as the agent output."
         )
 
         prompt = ChatPromptTemplate.from_messages(
