@@ -164,7 +164,9 @@ class Ros2HighLevelAgentNode(Node):
         self.declare_parameter("use_ollama", False)
         self.use_ollama: bool = self.get_parameter("use_ollama").get_parameter_value().bool_value
         self.declare_parameter("confirm", True)
-        self.confirm: bool = self.get_parameter("confirm").get_parameter_value().bool_value 
+        self.confirm: bool = self.get_parameter("confirm").get_parameter_value().bool_value
+        self.declare_parameter("format_response", False)
+        self.format_response: bool = self.get_parameter("format_response").get_parameter_value().bool_value
 
 
         # -----------------------------
@@ -306,7 +308,10 @@ class Ros2HighLevelAgentNode(Node):
                 return []
 
             # Present plan to user for confirmation
-            readable_plan = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps)])
+            if self.format_response:
+                readable_plan = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps)])
+            else:
+                readable_plan = final_text
             self.response_pub.publish(String(
                 data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
             ))
@@ -480,6 +485,7 @@ class Ros2HighLevelAgentNode(Node):
             "Your job: given a natural-language instruction, produce a short ordered list of actionable steps "
             "that a medium-level planner can execute. Keep steps concise, unambiguous and in the form "
             "'Action: <verb> <object/pose/params>'. "
+            "If the instruction is unclear, ask clarifying questions before proceeding."
             "The robot has 3 setpoints: 'home', 'ready', and 'handover'. Use these names when referring to them. "
             "The medium-level planner can handle commands like 'move to <setpoint>', 'move <direction>', 'pick up <object>', 'place at <location>', "
             "**ALWAYS** produce steps that can be executed by the medium-level planner. "
