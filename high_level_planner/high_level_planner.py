@@ -159,6 +159,11 @@ class Ros2HighLevelAgentNode(Node):
         super().__init__("ros2_high_level_agent")
         self.get_logger().info("Initializing Ros2 High-Level Agent Node...")
 
+        # Initialization flag: will be set to True after scene description is obtained
+        self.initialized = False
+        self.scene_description: Optional[str] = None
+        self._init_lock = threading.Lock()
+
         self.declare_parameter("real_hardware", False)
         self.real_hardware: bool = self.get_parameter("real_hardware").get_parameter_value().bool_value
         self.declare_parameter("use_ollama", False)
@@ -232,7 +237,13 @@ class Ros2HighLevelAgentNode(Node):
         self.response_pub = self.create_publisher(String, "/response", 10)
         self.benchmark_pub = self.create_publisher(String, "/benchmark_logs", 10)
 
-        self.get_logger().info("Ros2 High-Level Agent Node ready (listening /transcript, Prompt action server running).")
+        self.get_logger().info("Ros2 High-Level Agent Node initialized. Fetching scene description...")
+        
+        # Start scene description initialization in background thread
+        init_thread = threading.Thread(target=self._initialize_scene_description, daemon=False)
+        init_thread.start()
+
+        self.get_logger().info("Ros2 High-Level Agent Node ready (waiting for scene description before accepting requests).")
 
     def _benchmark_log(self, label: str):
         t = self.get_clock().now()
@@ -241,12 +252,63 @@ class Ros2HighLevelAgentNode(Node):
             String(data=f"{label},{t_sec:.9f}")
         )
 
+    def _initialize_scene_description(self):
+        """
+        Fetch the initial scene description from /vqa action.
+        Sets self.initialized to True once complete.
+        """
+        try:
+            self.get_logger().info("Waiting for /vqa action server...")
+            if not self.vision_vqa_client.wait_for_server(timeout_sec=30.0):
+                self.get_logger().error("/vqa action server unavailable after 30 seconds. Node will not initialize.")
+                with self._init_lock:
+                    self.scene_description = "Scene not available"
+                    self.initialized = True
+                return
+            
+            self.get_logger().info("Calling /vqa to describe the scene...")
+            goal = Prompt.Goal()
+            goal.prompt = "Describe the scene, including what object exists and how many of each object"
+            
+            send_future = self.vision_vqa_client.send_goal_async(goal)
+            rclpy.spin_until_future_complete(self, send_future)
+            goal_handle = send_future.result()
+            
+            if not goal_handle.accepted:
+                self.get_logger().error("VQA goal rejected during scene initialization")
+                with self._init_lock:
+                    self.scene_description = "Scene description unavailable"
+                    self.initialized = True
+                return
+            
+            result_future = goal_handle.get_result_async()
+            rclpy.spin_until_future_complete(self, result_future, timeout_sec=30.0)
+            result = result_future.result().result
+            
+            with self._init_lock:
+                self.scene_description = result if result else "Scene description unavailable"
+                self.initialized = True
+            
+            self.get_logger().info(f"Scene description obtained: {self.scene_description}")
+            self.response_pub.publish(String(data=f"Scene analysis: {self.scene_description}"))
+            
+        except Exception as e:
+            self.get_logger().error(f"Exception during scene initialization: {e}")
+            with self._init_lock:
+                self.scene_description = "Scene description unavailable"
+                self.initialized = True
+
     # -----------------------
     # Transcript handling
     # -----------------------
     def transcript_callback(self, msg: String):
         text = msg.data.strip()
         if not text:
+            return
+
+        if not self.initialized:
+            self.get_logger().warn("Node not fully initialized yet. Ignoring transcript.")
+            self.response_pub.publish(String(data="I'm still initializing. Please wait a moment."))
             return
 
         start_time = time.perf_counter()
@@ -363,6 +425,12 @@ class Ros2HighLevelAgentNode(Node):
         When the user confirms, execute the latest plan step-by-step.
         Clears chat history and latest plan after execution.
         """
+        if not self.initialized:
+            response.success = False
+            response.message = "Node not yet initialized. Please wait for scene analysis to complete."
+            self.response_pub.publish(String(data=response.message))
+            return response
+        
         if not self.latest_plan:
             response.success = False
             response.message = "No plan to confirm. Please give a new instruction first."
@@ -480,6 +548,9 @@ class Ros2HighLevelAgentNode(Node):
     # Create agent executor
     # -----------------------
     def _create_agent_executor(self) -> AgentExecutor:
+        with self._init_lock:
+            scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed."
+        
         system_message = (
             "You are a High-Level ROS2 planning assistant for a Robotic Arm."
             "Your job: given a natural-language instruction, produce a short ordered list of actionable steps "
@@ -491,7 +562,8 @@ class Ros2HighLevelAgentNode(Node):
             "**ALWAYS** produce steps that can be executed by the medium-level planner. "
             "You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment."
             "Use 'vqa' to find objects, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object"
-            "Then send the result to the medium-level planner to execute the action."
+            "Then send the result to the medium-level planner to execute the action.\n"
+            f"Current scene description: {scene_desc}"
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -510,6 +582,9 @@ class Ros2HighLevelAgentNode(Node):
     # Action server callbacks (high-level)
     # -----------------------
     def goal_callback(self, goal_request) -> GoalResponse:
+        if not self.initialized:
+            self.get_logger().warn("[high-level action] Goal received but node not initialized yet.")
+            return GoalResponse.REJECT
         self.get_logger().info(f"[high-level action] Received goal: {getattr(goal_request, 'prompt', '')}")
         with self._tools_called_lock:
             self._tools_called = []
