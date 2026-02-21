@@ -324,9 +324,12 @@ class Ros2HighLevelAgentNode(Node):
                 return
 
             result = result_container[0].result
+            scene_response = None
+            if result is not None:
+                scene_response = getattr(result, "final_response", None) or str(result)
 
             with self._init_lock:
-                self.scene_description = result if result else "Scene description unavailable"
+                self.scene_description = scene_response if scene_response else "Scene description unavailable"
                 scene_desc = self.scene_description
             self.agent_executor = self._create_agent_executor(scene_desc=scene_desc)
             with self._init_lock:
