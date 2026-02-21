@@ -314,7 +314,7 @@ class Ros2HighLevelAgentNode(Node):
             result_future = goal_handle.get_result_async()
             result_future.add_done_callback(result_callback)
 
-            if not result_event.wait(timeout=30.0):
+            if not result_event.wait(timeout=120.0):
                 self.get_logger().error("Timeout waiting for VQA result")
                 with self._init_lock:
                     self.scene_description = "Scene description unavailable"
@@ -617,12 +617,13 @@ class Ros2HighLevelAgentNode(Node):
             "that a medium-level planner can execute. Keep steps concise, unambiguous and in the form "
             "'Action: <verb> <object/pose/params>'. "
             "The robot has 3 setpoints: 'home', 'ready', and 'handover'. Use these names when referring to them. "
-            "The medium-level planner can handle commands like 'move to <setpoint>', 'move <direction>', 'pick up <object>', 'place at <location>', "
+            "The medium-level planner can handle commands like 'move to <setpoint>', 'move <direction>', 'move to <object>, 'pick up <object>', 'place at <location>', "
             # "**ALWAYS** produce steps that can be executed by the medium-level planner. "
             "You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment."
             "Use 'vqa' to IDENTIFY object, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object"
             "Then send the result to the medium-level planner to execute the action.\n"
             f"Current scene description: {scene_desc}"
+            "If the instruction specify an existing object, no need to use 'vqa'."
             "If the instruction is unclear, RESPONSE with a clarifying questions before proceeding."
         )
 
