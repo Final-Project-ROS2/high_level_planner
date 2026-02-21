@@ -214,8 +214,8 @@ class Ros2HighLevelAgentNode(Node):
         # Initialize LangChain tools (vision wrappers, medium-level submitter, etc.)
         self.tools = self._initialize_tools()
 
-        # Create LangChain agent similar to medium-level
-        self.agent_executor = self._create_agent_executor()
+        # Create LangChain agent after scene initialization
+        self.agent_executor: Optional[AgentExecutor] = None
 
         # Chat history
         self.chat_history: List[Dict[str, str]] = []  # [{'role': 'user', 'content': ...}, {'role': 'ai', 'content': ...}]
@@ -263,32 +263,75 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().error("/vqa action server unavailable after 30 seconds. Node will not initialize.")
                 with self._init_lock:
                     self.scene_description = "Scene not available"
+                    scene_desc = self.scene_description
+                self.agent_executor = self._create_agent_executor(scene_desc=scene_desc)
+                with self._init_lock:
                     self.initialized = True
                 return
             
             self.get_logger().info("Calling /vqa to describe the scene...")
             goal = Prompt.Goal()
             goal.prompt = "Describe the scene, including what object exists and how many of each object"
-            
+
+            goal_event = threading.Event()
+            result_event = threading.Event()
+            goal_handle_container = [None]
+            result_container = [None]
+
+            def goal_response_callback(future):
+                goal_handle_container[0] = future.result()
+                goal_event.set()
+
+            def result_callback(future):
+                result_container[0] = future.result()
+                result_event.set()
+
             send_future = self.vision_vqa_client.send_goal_async(goal)
-            rclpy.spin_until_future_complete(self, send_future)
-            goal_handle = send_future.result()
-            
+            send_future.add_done_callback(goal_response_callback)
+
+            if not goal_event.wait(timeout=30.0):
+                self.get_logger().error("Timeout waiting for VQA goal acceptance")
+                with self._init_lock:
+                    self.scene_description = "Scene description unavailable"
+                    scene_desc = self.scene_description
+                self.agent_executor = self._create_agent_executor(scene_desc=scene_desc)
+                with self._init_lock:
+                    self.initialized = True
+                return
+
+            goal_handle = goal_handle_container[0]
             if not goal_handle.accepted:
                 self.get_logger().error("VQA goal rejected during scene initialization")
                 with self._init_lock:
                     self.scene_description = "Scene description unavailable"
+                    scene_desc = self.scene_description
+                self.agent_executor = self._create_agent_executor(scene_desc=scene_desc)
+                with self._init_lock:
                     self.initialized = True
                 return
-            
+
             result_future = goal_handle.get_result_async()
-            rclpy.spin_until_future_complete(self, result_future, timeout_sec=30.0)
-            result = result_future.result().result
-            
+            result_future.add_done_callback(result_callback)
+
+            if not result_event.wait(timeout=30.0):
+                self.get_logger().error("Timeout waiting for VQA result")
+                with self._init_lock:
+                    self.scene_description = "Scene description unavailable"
+                    scene_desc = self.scene_description
+                self.agent_executor = self._create_agent_executor(scene_desc=scene_desc)
+                with self._init_lock:
+                    self.initialized = True
+                return
+
+            result = result_container[0].result
+
             with self._init_lock:
                 self.scene_description = result if result else "Scene description unavailable"
+                scene_desc = self.scene_description
+            self.agent_executor = self._create_agent_executor(scene_desc=scene_desc)
+            with self._init_lock:
                 self.initialized = True
-            
+
             self.get_logger().info(f"Scene description obtained: {self.scene_description}")
             self.response_pub.publish(String(data=f"Scene analysis: {self.scene_description}"))
             
@@ -296,6 +339,9 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().error(f"Exception during scene initialization: {e}")
             with self._init_lock:
                 self.scene_description = "Scene description unavailable"
+                scene_desc = self.scene_description
+            self.agent_executor = self._create_agent_executor(scene_desc=scene_desc)
+            with self._init_lock:
                 self.initialized = True
 
     # -----------------------
@@ -547,9 +593,10 @@ class Ros2HighLevelAgentNode(Node):
     # -----------------------
     # Create agent executor
     # -----------------------
-    def _create_agent_executor(self) -> AgentExecutor:
-        with self._init_lock:
-            scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed."
+    def _create_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
+        if scene_desc is None:
+            with self._init_lock:
+                scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed."
         
         system_message = (
             "You are a High-Level ROS2 planning assistant for a Robotic Arm."
