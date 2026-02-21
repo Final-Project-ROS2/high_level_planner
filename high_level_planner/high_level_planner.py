@@ -172,7 +172,8 @@ class Ros2HighLevelAgentNode(Node):
         self.confirm: bool = self.get_parameter("confirm").get_parameter_value().bool_value
         self.declare_parameter("format_response", False)
         self.format_response: bool = self.get_parameter("format_response").get_parameter_value().bool_value
-
+        self.declare_parameter("ollama_model", "qwen3:8b")
+        self.ollama_model: str = self.get_parameter("ollama_model").get_parameter_value().string_value
 
         # -----------------------------
         # LLM Selection: Gemini or Ollama
@@ -181,7 +182,7 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().info("Using local LLM via Ollama.")
             # Example: using llama3.1 or any model installed in `ollama list`
             self.llm = ChatOllama(
-                model="gpt-oss:20b",   # <--- change to any local model you want
+                model=self.ollama_model,   # <--- change to any local model you want
                 temperature=0.0
             )
         else:
@@ -313,7 +314,7 @@ class Ros2HighLevelAgentNode(Node):
             result_future = goal_handle.get_result_async()
             result_future.add_done_callback(result_callback)
 
-            if not result_event.wait(timeout=30.0):
+            if not result_event.wait(timeout=120.0):
                 self.get_logger().error("Timeout waiting for VQA result")
                 with self._init_lock:
                     self.scene_description = "Scene description unavailable"
@@ -528,6 +529,15 @@ class Ros2HighLevelAgentNode(Node):
         """
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         steps = []
+
+        # First, capture explicit "Action:" patterns anywhere in the text so we handle
+        # responses like "Action: move to ready" or multiple actions in a single message.
+        action_matches = re.findall(r"Action:\s*([^\n\r]+)", text, flags=re.IGNORECASE)
+        for match in action_matches:
+            cleaned = match.strip().strip("- .")
+            if len(cleaned) > 3:
+                steps.append(cleaned)
+
         for ln in lines:
             # numbered or dashed lines
             if ln[0].isdigit() or ln.startswith("-") or ln.lower().startswith("step"):
@@ -606,14 +616,15 @@ class Ros2HighLevelAgentNode(Node):
             "Your job: given a natural-language instruction, produce a short ordered list of actionable steps "
             "that a medium-level planner can execute. Keep steps concise, unambiguous and in the form "
             "'Action: <verb> <object/pose/params>'. "
-            "If the instruction is unclear, RESPONSE with a clarifying questions before proceeding."
             "The robot has 3 setpoints: 'home', 'ready', and 'handover'. Use these names when referring to them. "
-            "The medium-level planner can handle commands like 'move to <setpoint>', 'move <direction>', 'pick up <object>', 'place at <location>', "
-            "**ALWAYS** produce steps that can be executed by the medium-level planner. "
+            "The medium-level planner can handle commands like 'move to <setpoint>', 'move <direction>', 'move to <object>, 'pick up <object>', 'place at <location>', "
+            # "**ALWAYS** produce steps that can be executed by the medium-level planner. "
             "You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment."
-            "Use 'vqa' to find objects, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object"
+            "Use 'vqa' to IDENTIFY object, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object"
             "Then send the result to the medium-level planner to execute the action.\n"
             f"Current scene description: {scene_desc}"
+            "If the instruction specify an existing object, no need to use 'vqa'."
+            "If the instruction is unclear, RESPONSE with a clarifying questions before proceeding."
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -737,7 +748,7 @@ class Ros2HighLevelAgentNode(Node):
             self.get_logger().error(f"Exception when sending to medium: {e}")
             return None
 
-    def send_step_to_medium_async(self, step_text: str, timeout: float = 30.0) -> Optional[Prompt.Result]:
+    def send_step_to_medium_async(self, step_text: str, timeout: float = 120.0) -> Optional[Prompt.Result]:
         """
         Thread-safe version that uses threading.Event instead of spin_until_future_complete.
         """
