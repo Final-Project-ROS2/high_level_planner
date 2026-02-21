@@ -603,7 +603,7 @@ class Ros2HighLevelAgentNode(Node):
             "Your job: given a natural-language instruction, produce a short ordered list of actionable steps "
             "that a medium-level planner can execute. Keep steps concise, unambiguous and in the form "
             "'Action: <verb> <object/pose/params>'. "
-            "If the instruction is unclear, ask clarifying questions before proceeding."
+            "If the instruction is unclear, RESPONSE with a clarifying questions before proceeding."
             "The robot has 3 setpoints: 'home', 'ready', and 'handover'. Use these names when referring to them. "
             "The medium-level planner can handle commands like 'move to <setpoint>', 'move <direction>', 'pick up <object>', 'place at <location>', "
             "**ALWAYS** produce steps that can be executed by the medium-level planner. "
