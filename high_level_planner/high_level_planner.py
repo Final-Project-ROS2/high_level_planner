@@ -618,10 +618,13 @@ class Ros2HighLevelAgentNode(Node):
             "'Action: <verb> <object/pose/params>'. "
             "The robot has 3 setpoints: 'home', 'ready', and 'handover'. Use these names when referring to them. "
             "The medium-level planner can handle commands like 'move to <setpoint>', 'move <direction>', 'move to <object>, 'pick up <object>', 'place at <location>', "
+            "Add context to your steps by referencing the scene when relevant, for example 'pick up the second screwdriver from the left'"
             # "**ALWAYS** produce steps that can be executed by the medium-level planner. "
             "You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment."
-            "Use 'vqa' to IDENTIFY object, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object"
-            "Then send the result to the medium-level planner to execute the action.\n"
+            "Use 'vqa' to IDENTIFY object when the user DOES NOT explicitly give you an object name, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object"
+            # "Then send the result to the medium-level planner to execute the action.\n"
+            "If the user explicitly gives you an object name, you can directly use it in your steps without calling 'vqa'. For example, if the user says 'pick up the red cup', you can directly generate a step 'Action: pick up the red cup' without using 'vqa'."
+            "You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions"
             f"Current scene description: {scene_desc}"
             "If the instruction specify an existing object, no need to use 'vqa'."
             "If the instruction is unclear, RESPONSE with a clarifying questions before proceeding."
@@ -733,7 +736,10 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().error("/medium_level action server unavailable")
                 return None
             goal = Prompt.Goal()
-            goal.prompt = step_text
+            # Include scene description context with the step
+            with self._init_lock:
+                scene_desc = self.scene_description if self.scene_description else "No scene description available"
+            goal.prompt = f"{step_text}\n[Scene Context: {scene_desc}]"
             send_future = self.medium_level_client.send_goal_async(goal)
             rclpy.spin_until_future_complete(self, send_future)
             goal_handle = send_future.result()
@@ -758,7 +764,10 @@ class Ros2HighLevelAgentNode(Node):
                 return None
             
             goal = Prompt.Goal()
-            goal.prompt = step_text
+            # Include scene description context with the step
+            with self._init_lock:
+                scene_desc = self.scene_description if self.scene_description else "No scene description available"
+            goal.prompt = f"{step_text}\n[Scene Context: {scene_desc}]"
             
             # Use events to wait for async operations
             goal_event = threading.Event()
