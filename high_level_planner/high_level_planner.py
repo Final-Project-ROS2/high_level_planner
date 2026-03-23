@@ -236,6 +236,7 @@ class Ros2HighLevelAgentNode(Node):
         )
 
         self.response_pub = self.create_publisher(String, "/response", 10)
+        self.tts_pub = self.create_publisher(String, "/tts", 10)
         self.benchmark_pub = self.create_publisher(String, "/benchmark_logs", 10)
 
         self.get_logger().info("Ros2 High-Level Agent Node initialized. Fetching scene description...")
@@ -252,6 +253,18 @@ class Ros2HighLevelAgentNode(Node):
         self.benchmark_pub.publish(
             String(data=f"{label},{t_sec:.9f}")
         )
+
+    def _publish_response_with_tts(self, message: str):
+        """
+        Publish a message to both /response and /tts topics.
+        - /response: full formatted text for user to read
+        - /tts: cleaned text optimized for text-to-speech
+        """
+        self.response_pub.publish(String(data=message))
+        # Clean the message for TTS (remove technical junk, collapse whitespace, etc.)
+        tts_message = clean_agent_text(message)
+        if tts_message:  # Only publish if there's meaningful content after cleaning
+            self.tts_pub.publish(String(data=tts_message))
 
     def _initialize_scene_description(self):
         """
@@ -337,7 +350,7 @@ class Ros2HighLevelAgentNode(Node):
                 self.initialized = True
 
             self.get_logger().info(f"Scene description obtained: {self.scene_description}")
-            self.response_pub.publish(String(data=f"Scene analysis: {self.scene_description}"))
+            self._publish_response_with_tts(f"Scene analysis: {self.scene_description}")
             
         except Exception as e:
             self.get_logger().error(f"Exception during scene initialization: {e}")
@@ -358,7 +371,7 @@ class Ros2HighLevelAgentNode(Node):
 
         if not self.initialized:
             self.get_logger().warn("Node not fully initialized yet. Ignoring transcript.")
-            self.response_pub.publish(String(data="I'm still initializing. Please wait a moment."))
+            self._publish_response_with_tts("I'm still initializing. Please wait a moment.")
             return
 
         start_time = time.perf_counter()
@@ -386,7 +399,7 @@ class Ros2HighLevelAgentNode(Node):
 
         try:
             self.get_logger().info("High-level agent: thinking and generating plan...")
-            self.response_pub.publish(String(data="Got it! Let me think through that..."))
+            self._publish_response_with_tts("Got it! Let me think through that...")
         
             langchain_history = []
             for msg in self.chat_history[:-1]:  # Exclude the current message we just added
@@ -416,7 +429,7 @@ class Ros2HighLevelAgentNode(Node):
 
             if not steps:
                 msg = "Hmm... I couldn't figure out any clear steps. Could you try rephrasing that?"
-                self.response_pub.publish(String(data=msg))
+                self._publish_response_with_tts(msg)
                 return []
 
             # Present plan to user for confirmation
@@ -424,35 +437,35 @@ class Ros2HighLevelAgentNode(Node):
                 readable_plan = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps)])
             else:
                 readable_plan = final_text
-            self.response_pub.publish(String(
-                data=f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
-            ))
+            self._publish_response_with_tts(
+                f"Here's what I plan to do:\n{readable_plan}\n\nPlease review and confirm if this looks good!"
+            )
             if self.confirm:
                 self.get_logger().info(f"Generated plan with {len(steps)} steps, waiting for /confirm.")
             else:
                 # Execute the plan in a separate thread to avoid blocking the service callback
                 def execute_plan():
-                    self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+                    self._publish_response_with_tts("Got it! Executing your approved plan now...")
                     self.get_logger().info("Executing confirmed plan...")
 
                     for i, step in enumerate(self.latest_plan, start=1):
-                        self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
+                        self._publish_response_with_tts(f"Starting step {i}: {step}")
                         result = self.send_step_to_medium_async(step)
 
                         if result is None or not result.success:
                             msg = f"Step {i} failed: {step}. Stopping execution."
-                            self.response_pub.publish(String(data=msg))
+                            self._publish_response_with_tts(msg)
                             self.get_logger().error(msg)
                             break
                         else:
                             done_msg = f"Step {i} completed successfully."
-                            self.response_pub.publish(String(data=done_msg))
+                            self._publish_response_with_tts(done_msg)
                             self.get_logger().info(done_msg)
 
                     end_time = time.perf_counter()
                     benchmark_info = f"High-level action completed in {end_time - self.start_time:.2f} seconds"
                     self.benchmark_pub.publish(String(data=benchmark_info))
-                    self.response_pub.publish(String(data="Plan execution finished."))
+                    self._publish_response_with_tts("Plan execution finished.")
                     self.get_logger().info("All steps done. Clearing chat history and plan.")
                     self.chat_history.clear()
                     self.latest_plan.clear()
@@ -478,35 +491,35 @@ class Ros2HighLevelAgentNode(Node):
         if not self.initialized:
             response.success = False
             response.message = "Node not yet initialized. Please wait for scene analysis to complete."
-            self.response_pub.publish(String(data=response.message))
+            self._publish_response_with_tts(response.message)
             return response
         
         if not self.latest_plan:
             response.success = False
             response.message = "No plan to confirm. Please give a new instruction first."
-            self.response_pub.publish(String(data=response.message))
+            self._publish_response_with_tts(response.message)
             return response
 
         # Execute the plan in a separate thread to avoid blocking the service callback
         def execute_plan():
-            self.response_pub.publish(String(data="Got it! Executing your approved plan now..."))
+            self._publish_response_with_tts("Got it! Executing your approved plan now...")
             self.get_logger().info("Executing confirmed plan...")
 
             for i, step in enumerate(self.latest_plan, start=1):
-                self.response_pub.publish(String(data=f"Starting step {i}: {step}"))
+                self._publish_response_with_tts(f"Starting step {i}: {step}")
                 result = self.send_step_to_medium_async(step)
 
                 if result is None or not result.success:
                     msg = f"Step {i} failed: {step}. Stopping execution."
-                    self.response_pub.publish(String(data=msg))
+                    self._publish_response_with_tts(msg)
                     self.get_logger().error(msg)
                     break
                 else:
                     done_msg = f"Step {i} completed successfully."
-                    self.response_pub.publish(String(data=done_msg))
+                    self._publish_response_with_tts(done_msg)
                     self.get_logger().info(done_msg)
 
-            self.response_pub.publish(String(data="Plan execution finished."))
+            self._publish_response_with_tts("Plan execution finished.")
             self.get_logger().info("All steps done. Clearing chat history and plan.")
             self.chat_history.clear()
             self.latest_plan.clear()
