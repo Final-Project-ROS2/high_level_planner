@@ -30,8 +30,8 @@ from std_srvs.srv import SetBool, Trigger
 from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 
-# Action used for inter-level communication (re-using your Prompt action)
-from custom_interfaces.action import Prompt
+# Action used for inter-level communication
+from custom_interfaces.action import Prompt, PromptScene
 
 # Vision service types (assumes these exist in your workspace)
 from custom_interfaces.srv import (
@@ -132,6 +132,9 @@ def clean_agent_text(text: str) -> str:
 ENV_PATH = '/home/group11/final_project_ws/src/high_level_planner/.env'
 load_dotenv(dotenv_path=ENV_PATH)
 
+SCENE_DESC_MODES = {"default", "custom", "disabled"}
+DOMAIN_MODES = {"default", "blocksworld", "gripper"}
+
 class ROSLogPublisher(io.TextIOBase):
     def __init__(self, publisher):
         self.publisher = publisher
@@ -172,6 +175,19 @@ class Ros2HighLevelAgentNode(Node):
         self.confirm: bool = self.get_parameter("confirm").get_parameter_value().bool_value
         self.declare_parameter("format_response", False)
         self.format_response: bool = self.get_parameter("format_response").get_parameter_value().bool_value
+
+        self.declare_parameter("scene_desc", "default")
+        raw_scene_desc_mode = self.get_parameter("scene_desc").get_parameter_value().string_value
+        self.scene_desc_mode = self._validate_enum_parameter("scene_desc", raw_scene_desc_mode, SCENE_DESC_MODES)
+
+        self.declare_parameter("domain", "default")
+        raw_domain_mode = self.get_parameter("domain").get_parameter_value().string_value
+        self.domain_mode = self._validate_enum_parameter("domain", raw_domain_mode, DOMAIN_MODES)
+
+        self.get_logger().info(
+            f"Planner configuration: scene_desc={self.scene_desc_mode}, domain={self.domain_mode}"
+        )
+
         self.declare_parameter("ollama_model", "qwen3:8b")
         self.ollama_model: str = self.get_parameter("ollama_model").get_parameter_value().string_value
 
@@ -225,10 +241,12 @@ class Ros2HighLevelAgentNode(Node):
         # Create a new service for confirmation
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
 
+        self.high_level_action_type = PromptScene if self.scene_desc_mode == "custom" else Prompt
+
         # Action server to accept high-level Prompt requests
         self._action_server = ActionServer(
             self,
-            Prompt,
+            self.high_level_action_type,
             "prompt_high_level",
             execute_callback=self.execute_callback,
             goal_callback=self.goal_callback,
@@ -239,13 +257,36 @@ class Ros2HighLevelAgentNode(Node):
         self.tts_pub = self.create_publisher(String, "/tts", 10)
         self.benchmark_pub = self.create_publisher(String, "/benchmark_logs", 10)
 
-        self.get_logger().info("Ros2 High-Level Agent Node initialized. Fetching scene description...")
-        
-        # Start scene description initialization in background thread
-        init_thread = threading.Thread(target=self._initialize_scene_description, daemon=False)
-        init_thread.start()
+        if self.scene_desc_mode == "default":
+            self.get_logger().info("Ros2 High-Level Agent Node initialized. Fetching scene description...")
+            init_thread = threading.Thread(target=self._initialize_scene_description, daemon=False)
+            init_thread.start()
+            self.get_logger().info("Ros2 High-Level Agent Node ready (waiting for scene description before accepting requests).")
+        else:
+            if self.scene_desc_mode == "custom":
+                self.scene_description = "Scene description provided via /prompt_high_level requests"
+            else:
+                self.scene_description = None
 
-        self.get_logger().info("Ros2 High-Level Agent Node ready (waiting for scene description before accepting requests).")
+            self.agent_executor = self._create_agent_executor(
+                scene_desc=self.scene_description if self.scene_desc_mode != "disabled" else None
+            )
+            with self._init_lock:
+                self.initialized = True
+            self.get_logger().info(
+                "Ros2 High-Level Agent Node ready (scene initialization via /vqa is disabled by configuration)."
+            )
+
+    def _validate_enum_parameter(self, name: str, value: str, valid_values: set) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized in valid_values:
+            return normalized
+        fallback = "default" if "default" in valid_values else sorted(valid_values)[0]
+        self.get_logger().warn(
+            f"Invalid value '{value}' for parameter '{name}'. Falling back to '{fallback}'. "
+            f"Valid values: {sorted(valid_values)}"
+        )
+        return fallback
 
     def _benchmark_log(self, label: str):
         t = self.get_clock().now()
@@ -369,6 +410,15 @@ class Ros2HighLevelAgentNode(Node):
         if not text:
             return
 
+        if self.scene_desc_mode == "custom":
+            warn_msg = (
+                "scene_desc=custom requires /prompt_high_level action requests with scene_desc. "
+                "Transcript input is ignored in this mode."
+            )
+            self.get_logger().warn(warn_msg)
+            self.response_pub.publish(String(data=warn_msg))
+            return
+
         if not self.initialized:
             self.get_logger().warn("Node not fully initialized yet. Ignoring transcript.")
             self._publish_response_with_tts("I'm still initializing. Please wait a moment.")
@@ -389,7 +439,12 @@ class Ros2HighLevelAgentNode(Node):
         )
         plan_thread.start()
 
-    def _generate_plan(self, instruction_text: str, start_time: Optional[float] = None) -> List[str]:
+    def _generate_plan(
+        self,
+        instruction_text: str,
+        start_time: Optional[float] = None,
+        request_scene_desc: Optional[str] = None,
+    ) -> List[str]:
         """
         Generate a plan (list of steps) from the user's instruction but do NOT execute.
         The plan is stored internally for later confirmation.
@@ -400,6 +455,29 @@ class Ros2HighLevelAgentNode(Node):
         try:
             self.get_logger().info("High-level agent: thinking and generating plan...")
             self._publish_response_with_tts("Got it! Let me think through that...")
+
+            if self.scene_desc_mode == "custom":
+                scene_from_request = (request_scene_desc or "").strip()
+                if not scene_from_request:
+                    self.get_logger().warn(
+                        "scene_desc=custom but request scene_desc is empty. Falling back to placeholder."
+                    )
+                    scene_from_request = "Scene description unavailable"
+                with self._init_lock:
+                    self.scene_description = scene_from_request
+                self.get_logger().info(f"scene_desc=custom: using scene description from request: {scene_from_request}")
+                self.agent_executor = self._create_agent_executor(scene_desc=scene_from_request)
+            elif self.scene_desc_mode == "disabled":
+                self.scene_description = None
+                if self.agent_executor is None:
+                    self.agent_executor = self._create_agent_executor(scene_desc=None)
+            elif self.agent_executor is None:
+                with self._init_lock:
+                    current_scene = self.scene_description
+                self.agent_executor = self._create_agent_executor(scene_desc=current_scene)
+
+            if self.agent_executor is None:
+                raise RuntimeError("Agent executor is not initialized")
         
             langchain_history = []
             for msg in self.chat_history[:-1]:  # Exclude the current message we just added
@@ -463,7 +541,8 @@ class Ros2HighLevelAgentNode(Node):
                             self.get_logger().info(done_msg)
 
                     end_time = time.perf_counter()
-                    benchmark_info = f"High-level action completed in {end_time - self.start_time:.2f} seconds"
+                    total_elapsed = end_time - start_time if start_time is not None else 0.0
+                    benchmark_info = f"High-level action completed in {total_elapsed:.2f} seconds"
                     self.benchmark_pub.publish(String(data=benchmark_info))
                     self._publish_response_with_tts("Plan execution finished.")
                     self.get_logger().info("All steps done. Clearing chat history and plan.")
@@ -612,36 +691,97 @@ class Ros2HighLevelAgentNode(Node):
                 self.get_logger().error(f"Exception when sending to VQA: {e}")
                 return None
 
-        tools.append(vqa)
+        if self.domain_mode == "default":
+            tools.append(vqa)
 
         return tools
 
     # -----------------------
     # Create agent executor
     # -----------------------
+    def _build_system_message(self, scene_desc: Optional[str]) -> str:
+        include_scene_desc = self.scene_desc_mode != "disabled"
+
+        if self.domain_mode == "blocksworld":
+            return self._build_blocksworld_system_message(scene_desc, include_scene_desc)
+        if self.domain_mode == "gripper":
+            return self._build_gripper_system_message(scene_desc, include_scene_desc)
+        return self._build_default_system_message(scene_desc, include_scene_desc)
+
+    def _build_default_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
+        scene_section = ""
+        if include_scene_desc:
+            effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
+            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+
+        return f"""You are a High-Level ROS2 planning assistant for a robotic arm.
+
+        {scene_section}
+
+        Your job: given a natural-language instruction, output a short ordered plan as plain text steps.
+        Each actionable step MUST use this format exactly:
+        Action: <verb> <object/pose/params>
+
+        Requirements:
+        - Keep each step concise and executable by the medium-level planner.
+        - The robot has 3 setpoints: home, ready, and handover.
+        - Use these action styles: move to <setpoint>, move <direction>, move to <object>, pick up <object>, place at <location>.
+        - Use scene context when useful (for example: pick up screwdriver_leftmost).
+        - If the user instruction is unclear, ask one concise clarifying question instead of generating steps.
+
+        Tool usage:
+        - You may use vqa only when object identity is ambiguous.
+        - If the user already names the object clearly, do not call vqa.
+        """
+
+    def _build_blocksworld_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
+        scene_section = ""
+        if include_scene_desc:
+            effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
+            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+
+        return f"""You are a High-Level ROS2 planning assistant operating in the Blocksworld domain.
+
+        {scene_section}
+
+        Your job: convert the user's block-stacking instruction into a short ordered plain-text plan.
+        Each actionable step MUST use this format exactly:
+        Action: <verb> <object/pose/params>
+
+        Domain guidance:
+        - Prefer explicit block references in steps (for example: move to red_block, pick up red_block, place at on top of blue_block).
+        - Keep stack order logically consistent with the request.
+        - If object identity is ambiguous, use descriptive modifiers (for example: block_leftmost) instead of asking multiple questions.
+        - If instruction is fundamentally ambiguous, ask one concise clarifying question.
+        """
+
+    def _build_gripper_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
+        scene_section = ""
+        if include_scene_desc:
+            effective_scene_desc = scene_desc if scene_desc else "Scene not yet analyzed"
+            scene_section = f"\nCurrent scene description: {effective_scene_desc}\n"
+
+        return f"""You are a High-Level ROS2 planning assistant operating in the Gripper domain.
+
+        {scene_section}
+
+        Your job: convert the user's transport instruction into a short ordered plain-text plan.
+        Each actionable step MUST use this format exactly:
+        Action: <verb> <object/pose/params>
+
+        Domain guidance:
+        - Focus on moving objects between rooms (for example roomA to roomB).
+        - Keep steps executable by a medium-level manipulation controller.
+        - Mention which object to pick and where to place it.
+        - If instruction is fundamentally ambiguous, ask one concise clarifying question.
+        """
+
     def _create_agent_executor(self, scene_desc: Optional[str] = None) -> AgentExecutor:
         if scene_desc is None:
             with self._init_lock:
                 scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed."
-        
-        system_message = (
-            "You are a High-Level ROS2 planning assistant for a Robotic Arm."
-            "Your job: given a natural-language instruction, produce a short ordered list of actionable steps "
-            "that a medium-level planner can execute. Keep steps concise, unambiguous and in the form "
-            "'Action: <verb> <object/pose/params>'. "
-            "The robot has 3 setpoints: 'home', 'ready', and 'handover'. Use these names when referring to them. "
-            "The medium-level planner can handle commands like 'move to <setpoint>', 'move <direction>', 'move to <object>, 'pick up <object>', 'place at <location>', "
-            "Add context to your steps by referencing the scene when relevant, for example 'pick up the second screwdriver from the left'"
-            # "**ALWAYS** produce steps that can be executed by the medium-level planner. "
-            "You have access to vision tools like 'vqa' to inspect the scene. You can ask visual questions to gather information about the environment."
-            "Use 'vqa' to IDENTIFY object when the user DOES NOT explicitly give you an object name, for example: If the user asks to pickup the left most object, use 'vqa' to ask 'Which object is the left most?' to get the name of the object"
-            # "Then send the result to the medium-level planner to execute the action.\n"
-            "If the user explicitly gives you an object name, you can directly use it in your steps without calling 'vqa'. For example, if the user says 'pick up the red cup', you can directly generate a step 'Action: pick up the red cup' without using 'vqa'."
-            "You can add modifiers to the object name, like screwdriver_leftmost, so you DO NOT need to ask clarifying questions"
-            f"Current scene description: {scene_desc}"
-            "If the instruction specify an existing object, no need to use 'vqa'."
-            "If the instruction is unclear, RESPONSE with a clarifying questions before proceeding."
-        )
+
+        system_message = self._build_system_message(scene_desc)
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -672,37 +812,45 @@ class Ros2HighLevelAgentNode(Node):
         return CancelResponse.ACCEPT
 
     async def execute_callback(self, goal_handle):
-        start_time = time.perf_counter()
+        self.start_time = time.perf_counter()
         self._benchmark_log("action_goal_received")
 
         prompt_text = goal_handle.request.prompt
         self.get_logger().info(f"[high-level action] Executing prompt: {prompt_text}")
 
-        feedback_msg = Prompt.Feedback()
+        feedback_msg = self.high_level_action_type.Feedback()
 
-        result_container: Dict[str, Any] = {"success": True, "final_response": "Internal error"}
+        result_container: Dict[str, Any] = {"success": False, "final_response": "Internal error"}
 
         def run_agent_action():
+            try:
                 goal_text = goal_handle.request.prompt.strip()
                 if not goal_text:
-                    goal_handle.abort()
-                    return Prompt.Result(success=False, final_response="Empty prompt")
+                    result_container["success"] = False
+                    result_container["final_response"] = "Empty prompt"
+                    return
 
                 self.get_logger().info(f"High-level Prompt action received: {goal_text}")
-                # self.response_pub.publish(String(data=f"You said: {goal_text}"))
+                request_scene_desc = getattr(goal_handle.request, "scene_desc", None)
 
                 # Generate plan but do not execute
-                steps = self._generate_plan(goal_text, start_time=start_time)
+                steps = self._generate_plan(
+                    goal_text,
+                    start_time=self.start_time,
+                    request_scene_desc=request_scene_desc,
+                )
                 if not steps:
-                    goal_handle.abort()
-                    return Prompt.Result(success=False, final_response="Failed to generate plan")
+                    result_container["success"] = False
+                    result_container["final_response"] = "Failed to generate plan"
+                    return
 
-                if self.confirm:
-                    # Wait for confirmation
-                    msg = f"Generated {len(steps)} step(s). Please review and confirm via /confirm to execute."
-
-                # self.response_pub.publish(String(data=msg))
-                return Prompt.Result(success=True, final_response=msg)
+                msg = f"Generated {len(steps)} step(s). Please review and confirm via /confirm to execute."
+                result_container["success"] = True
+                result_container["final_response"] = msg
+            except Exception as e:
+                self.get_logger().error(f"Exception in action pipeline: {e}")
+                result_container["success"] = False
+                result_container["final_response"] = f"Error: {e}"
 
 
         agent_thread = threading.Thread(target=run_agent_action, daemon=True)
@@ -728,7 +876,7 @@ class Ros2HighLevelAgentNode(Node):
         except Exception:
             pass
 
-        result_msg = Prompt.Result()
+        result_msg = self.high_level_action_type.Result()
         result_msg.success = bool(result_container.get("success", False))
         result_msg.final_response = str(result_container.get("final_response", ""))
 
