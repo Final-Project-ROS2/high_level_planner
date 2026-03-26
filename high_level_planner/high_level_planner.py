@@ -184,6 +184,9 @@ class Ros2HighLevelAgentNode(Node):
         raw_domain_mode = self.get_parameter("domain").get_parameter_value().string_value
         self.domain_mode = self._validate_enum_parameter("domain", raw_domain_mode, DOMAIN_MODES)
 
+        # Only keep conversational chat history in the default domain; other domains run statelessly per request.
+        self.use_chat_history: bool = self.domain_mode == "default"
+
         self.get_logger().info(
             f"Planner configuration: scene_desc={self.scene_desc_mode}, domain={self.domain_mode}"
         )
@@ -234,7 +237,7 @@ class Ros2HighLevelAgentNode(Node):
         # Create LangChain agent after scene initialization
         self.agent_executor: Optional[AgentExecutor] = None
 
-        # Chat history
+        # Chat history (used only when use_chat_history is True)
         self.chat_history: List[Dict[str, str]] = []  # [{'role': 'user', 'content': ...}, {'role': 'ai', 'content': ...}]
         self.latest_plan: Optional[List[str]] = None
 
@@ -449,8 +452,12 @@ class Ros2HighLevelAgentNode(Node):
         Generate a plan (list of steps) from the user's instruction but do NOT execute.
         The plan is stored internally for later confirmation.
         """
-        # Add user message to chat history
-        self.chat_history.append({"role": "user", "content": instruction_text})
+        if self.use_chat_history:
+            # Add user message to chat history
+            self.chat_history.append({"role": "user", "content": instruction_text})
+        else:
+            # Stateless mode: ensure any prior history is dropped
+            self.chat_history.clear()
 
         try:
             self.get_logger().info("High-level agent: thinking and generating plan...")
@@ -480,12 +487,14 @@ class Ros2HighLevelAgentNode(Node):
                 raise RuntimeError("Agent executor is not initialized")
         
             langchain_history = []
-            for msg in self.chat_history[:-1]:  # Exclude the current message we just added
-                if msg["role"] == "user":
-                    langchain_history.append(HumanMessage(content=msg["content"]))
-                elif msg["role"] == "assistant":
-                    langchain_history.append(AIMessage(content=msg["content"]))
-            # Invoke agent with chat history
+            if self.use_chat_history:
+                for msg in self.chat_history[:-1]:  # Exclude the current message we just added
+                    if msg["role"] == "user":
+                        langchain_history.append(HumanMessage(content=msg["content"]))
+                    elif msg["role"] == "assistant":
+                        langchain_history.append(AIMessage(content=msg["content"]))
+
+            # Invoke agent with chat history (empty when stateless)
             agent_resp = self.agent_executor.invoke({
                 "input": instruction_text,
                 "chat_history": langchain_history
@@ -493,8 +502,9 @@ class Ros2HighLevelAgentNode(Node):
         
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
 
-            # Add AI response to chat history
-            self.chat_history.append({"role": "assistant", "content": final_text})
+            if self.use_chat_history:
+                # Add AI response to chat history
+                self.chat_history.append({"role": "assistant", "content": final_text})
 
             # Parse steps
             steps = self._parse_steps_from_text(final_text)
