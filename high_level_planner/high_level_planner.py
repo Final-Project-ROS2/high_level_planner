@@ -191,7 +191,7 @@ class Ros2HighLevelAgentNode(Node):
             f"Planner configuration: scene_desc={self.scene_desc_mode}, domain={self.domain_mode}"
         )
 
-        self.declare_parameter("ollama_model", "qwen3:8b")
+        self.declare_parameter("ollama_model", "gpt-oss:20b")
         self.ollama_model: str = self.get_parameter("ollama_model").get_parameter_value().string_value
 
         # -----------------------------
