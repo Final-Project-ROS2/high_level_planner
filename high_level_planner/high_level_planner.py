@@ -20,7 +20,7 @@ import sys
 import os
 import threading
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
@@ -32,6 +32,10 @@ from geometry_msgs.msg import Pose
 
 # Action used for inter-level communication
 from custom_interfaces.action import Prompt, PromptScene
+try:
+    from custom_interfaces.action import PromptSceneToken
+except ImportError:
+    PromptSceneToken = None
 
 # Vision service types (assumes these exist in your workspace)
 from custom_interfaces.srv import (
@@ -44,6 +48,7 @@ from custom_interfaces.srv import (
 
 # LangChain
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import BaseTool, tool
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -149,6 +154,62 @@ class ROSLogPublisher(io.TextIOBase):
         pass
 
 
+class OllamaTokenUsageTracker(BaseCallbackHandler):
+    """Aggregate input/output token usage from LangChain/Ollama callbacks."""
+
+    def __init__(self):
+        super().__init__()
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    @staticmethod
+    def _to_int(value: Any) -> int:
+        try:
+            if value is None:
+                return 0
+            return max(0, int(value))
+        except Exception:
+            return 0
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        llm_output = getattr(response, "llm_output", {}) or {}
+        token_usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+
+        input_tokens = self._to_int(
+            token_usage.get("prompt_tokens") or token_usage.get("input_tokens")
+        )
+        output_tokens = self._to_int(
+            token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+        )
+        if input_tokens or output_tokens:
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            return
+
+        for generation_list in getattr(response, "generations", []) or []:
+            for generation in generation_list:
+                msg = getattr(generation, "message", None)
+                if msg is None:
+                    continue
+
+                usage_metadata = getattr(msg, "usage_metadata", None) or {}
+                input_tokens = self._to_int(
+                    usage_metadata.get("input_tokens") or usage_metadata.get("prompt_tokens")
+                )
+                output_tokens = self._to_int(
+                    usage_metadata.get("output_tokens") or usage_metadata.get("completion_tokens")
+                )
+                if input_tokens or output_tokens:
+                    self.input_tokens += input_tokens
+                    self.output_tokens += output_tokens
+                    continue
+
+                # Ollama commonly reports these counters in response metadata.
+                response_metadata = getattr(msg, "response_metadata", None) or {}
+                self.input_tokens += self._to_int(response_metadata.get("prompt_eval_count"))
+                self.output_tokens += self._to_int(response_metadata.get("eval_count"))
+
+
 class Ros2HighLevelAgentNode(Node):
     """
     High level planner node:
@@ -244,7 +305,18 @@ class Ros2HighLevelAgentNode(Node):
         # Create a new service for confirmation
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
 
-        self.high_level_action_type = PromptScene if self.scene_desc_mode == "custom" else Prompt
+        if self.use_ollama and PromptSceneToken is not None:
+            self.high_level_action_type = PromptSceneToken
+        elif self.scene_desc_mode == "custom":
+            self.high_level_action_type = PromptScene
+        else:
+            self.high_level_action_type = Prompt
+
+        if self.use_ollama and PromptSceneToken is None:
+            self.get_logger().warn(
+                "PromptSceneToken action interface is not available. "
+                "Falling back to existing high-level action interfaces without token fields."
+            )
 
         # Action server to accept high-level Prompt requests
         self._action_server = ActionServer(
@@ -447,7 +519,7 @@ class Ros2HighLevelAgentNode(Node):
         instruction_text: str,
         start_time: Optional[float] = None,
         request_scene_desc: Optional[str] = None,
-    ) -> List[str]:
+    ) -> Tuple[List[str], int, int]:
         """
         Generate a plan (list of steps) from the user's instruction but do NOT execute.
         The plan is stored internally for later confirmation.
@@ -458,6 +530,9 @@ class Ros2HighLevelAgentNode(Node):
         else:
             # Stateless mode: ensure any prior history is dropped
             self.chat_history.clear()
+
+        input_token_count = 0
+        output_token_count = 0
 
         try:
             self.get_logger().info("High-level agent: thinking and generating plan...")
@@ -495,12 +570,44 @@ class Ros2HighLevelAgentNode(Node):
                         langchain_history.append(AIMessage(content=msg["content"]))
 
             # Invoke agent with chat history (empty when stateless)
-            agent_resp = self.agent_executor.invoke({
+            invoke_payload = {
                 "input": instruction_text,
-                "chat_history": langchain_history
-            })
+                "chat_history": langchain_history,
+            }
+
+            token_tracker: Optional[OllamaTokenUsageTracker] = None
+            if self.use_ollama:
+                token_tracker = OllamaTokenUsageTracker()
+                try:
+                    agent_resp = self.agent_executor.invoke(
+                        invoke_payload,
+                        config={"callbacks": [token_tracker]},
+                    )
+                except TypeError:
+                    # Compatibility path for older LangChain invoke signatures.
+                    agent_resp = self.agent_executor.invoke(
+                        invoke_payload,
+                        callbacks=[token_tracker],
+                    )
+            else:
+                agent_resp = self.agent_executor.invoke(invoke_payload)
         
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
+
+            if token_tracker is not None:
+                input_token_count = int(token_tracker.input_tokens)
+                output_token_count = int(token_tracker.output_tokens)
+
+                if input_token_count <= 0:
+                    input_token_count = self._estimate_token_count(
+                        instruction_text + "\n" + "\n".join(m["content"] for m in self.chat_history[:-1])
+                    )
+                if output_token_count <= 0:
+                    output_token_count = self._estimate_token_count(final_text)
+
+                self.get_logger().info(
+                    f"Ollama token usage: input={input_token_count}, output={output_token_count}"
+                )
 
             if self.use_chat_history:
                 # Add AI response to chat history
@@ -518,7 +625,7 @@ class Ros2HighLevelAgentNode(Node):
             if not steps:
                 msg = "Hmm... I couldn't figure out any clear steps. Could you try rephrasing that?"
                 self._publish_response_with_tts(msg)
-                return []
+                return [], input_token_count, output_token_count
 
             # Present plan to user for confirmation
             if self.format_response:
@@ -563,14 +670,27 @@ class Ros2HighLevelAgentNode(Node):
                 execution_thread = threading.Thread(target=execute_plan, daemon=True)
                 execution_thread.start()
 
-            return steps
+            return steps, input_token_count, output_token_count
         except Exception as e:
             self.get_logger().error(f"Error generating plan: {e}")
             self.response_pub.publish(String(data="Sorry, something went wrong while planning."))
-            return []
+            return [], input_token_count, output_token_count
 
     def _plan_and_dispatch_from_transcript(self, instruction_text: str, start_time: float):
         self._generate_plan(instruction_text, start_time=start_time)
+
+    def _estimate_token_count(self, text: str) -> int:
+        """Best-effort token estimate when provider metadata is unavailable."""
+        if not text:
+            return 0
+        try:
+            if hasattr(self.llm, "get_num_tokens"):
+                count = self.llm.get_num_tokens(text)
+                if isinstance(count, int) and count >= 0:
+                    return count
+        except Exception:
+            pass
+        return len(text.split())
 
     def confirm_service_callback(self, request, response):
         """
@@ -830,7 +950,12 @@ class Ros2HighLevelAgentNode(Node):
 
         feedback_msg = self.high_level_action_type.Feedback()
 
-        result_container: Dict[str, Any] = {"success": False, "final_response": "Internal error"}
+        result_container: Dict[str, Any] = {
+            "success": False,
+            "final_response": "Internal error",
+            "input_token": 0,
+            "output_token": 0,
+        }
 
         def run_agent_action():
             try:
@@ -844,11 +969,13 @@ class Ros2HighLevelAgentNode(Node):
                 request_scene_desc = getattr(goal_handle.request, "scene_desc", None)
 
                 # Generate plan but do not execute
-                steps = self._generate_plan(
+                steps, input_token, output_token = self._generate_plan(
                     goal_text,
                     start_time=self.start_time,
                     request_scene_desc=request_scene_desc,
                 )
+                result_container["input_token"] = int(input_token)
+                result_container["output_token"] = int(output_token)
                 if not steps:
                     result_container["success"] = False
                     result_container["final_response"] = "Failed to generate plan"
@@ -889,6 +1016,10 @@ class Ros2HighLevelAgentNode(Node):
         result_msg = self.high_level_action_type.Result()
         result_msg.success = bool(result_container.get("success", False))
         result_msg.final_response = str(result_container.get("final_response", ""))
+        if hasattr(result_msg, "input_token"):
+            result_msg.input_token = int(result_container.get("input_token", 0))
+        if hasattr(result_msg, "output_token"):
+            result_msg.output_token = int(result_container.get("output_token", 0))
 
         goal_handle.succeed()
         self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
