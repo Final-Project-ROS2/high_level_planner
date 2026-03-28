@@ -31,7 +31,7 @@ from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 
 # Action used for inter-level communication
-from custom_interfaces.action import Prompt, PromptScene
+from custom_interfaces.action import Prompt, PromptScene, PromptSceneToken
 
 # Vision service types (assumes these exist in your workspace)
 from custom_interfaces.srv import (
@@ -236,6 +236,11 @@ class Ros2HighLevelAgentNode(Node):
 
         # Create LangChain agent after scene initialization
         self.agent_executor: Optional[AgentExecutor] = None
+        self._last_system_prompt_text: str = ""
+
+        # Lightweight token estimation state (character-based heuristic)
+        self._last_input_token_estimate = 0
+        self._last_output_token_estimate = 0
 
         # Chat history (used only when use_chat_history is True)
         self.chat_history: List[Dict[str, str]] = []  # [{'role': 'user', 'content': ...}, {'role': 'ai', 'content': ...}]
@@ -244,7 +249,12 @@ class Ros2HighLevelAgentNode(Node):
         # Create a new service for confirmation
         self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
 
-        self.high_level_action_type = PromptScene if self.scene_desc_mode == "custom" else Prompt
+        if self.domain_mode == "blocksworld":
+            self.high_level_action_type = PromptSceneToken
+        elif self.scene_desc_mode == "custom":
+            self.high_level_action_type = PromptScene
+        else:
+            self.high_level_action_type = Prompt
 
         # Action server to accept high-level Prompt requests
         self._action_server = ActionServer(
@@ -309,6 +319,11 @@ class Ros2HighLevelAgentNode(Node):
         tts_message = clean_agent_text(message)
         if tts_message:  # Only publish if there's meaningful content after cleaning
             self.tts_pub.publish(String(data=tts_message))
+
+    def _estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return max(1, len(text) // 4)
 
     def _initialize_scene_description(self):
         """
@@ -452,6 +467,9 @@ class Ros2HighLevelAgentNode(Node):
         Generate a plan (list of steps) from the user's instruction but do NOT execute.
         The plan is stored internally for later confirmation.
         """
+        self._last_input_token_estimate = 0
+        self._last_output_token_estimate = 0
+
         if self.use_chat_history:
             # Add user message to chat history
             self.chat_history.append({"role": "user", "content": instruction_text})
@@ -494,6 +512,17 @@ class Ros2HighLevelAgentNode(Node):
                     elif msg["role"] == "assistant":
                         langchain_history.append(AIMessage(content=msg["content"]))
 
+            history_texts = []
+            for msg in langchain_history:
+                role = "assistant"
+                if isinstance(msg, HumanMessage):
+                    role = "user"
+                history_texts.append(f"{role}: {msg.content}")
+
+            input_text_parts = [self._last_system_prompt_text, instruction_text]
+            input_text_parts.extend(history_texts)
+            self._last_input_token_estimate = self._estimate_tokens("\n".join(input_text_parts))
+
             # Invoke agent with chat history (empty when stateless)
             agent_resp = self.agent_executor.invoke({
                 "input": instruction_text,
@@ -501,6 +530,7 @@ class Ros2HighLevelAgentNode(Node):
             })
         
             final_text = agent_resp.get("output") if isinstance(agent_resp, dict) else str(agent_resp)
+            self._last_output_token_estimate = self._estimate_tokens(final_text)
 
             if self.use_chat_history:
                 # Add AI response to chat history
@@ -792,6 +822,7 @@ class Ros2HighLevelAgentNode(Node):
                 scene_desc = self.scene_description if self.scene_description else "Scene not yet analyzed."
 
         system_message = self._build_system_message(scene_desc)
+        self._last_system_prompt_text = system_message
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -830,7 +861,12 @@ class Ros2HighLevelAgentNode(Node):
 
         feedback_msg = self.high_level_action_type.Feedback()
 
-        result_container: Dict[str, Any] = {"success": False, "final_response": "Internal error"}
+        result_container: Dict[str, Any] = {
+            "success": False,
+            "final_response": "Internal error",
+            "input_token": 0,
+            "output_token": 0,
+        }
 
         def run_agent_action():
             try:
@@ -849,6 +885,8 @@ class Ros2HighLevelAgentNode(Node):
                     start_time=self.start_time,
                     request_scene_desc=request_scene_desc,
                 )
+                result_container["input_token"] = self._last_input_token_estimate
+                result_container["output_token"] = self._last_output_token_estimate
                 if not steps:
                     result_container["success"] = False
                     result_container["final_response"] = "Failed to generate plan"
@@ -889,6 +927,10 @@ class Ros2HighLevelAgentNode(Node):
         result_msg = self.high_level_action_type.Result()
         result_msg.success = bool(result_container.get("success", False))
         result_msg.final_response = str(result_container.get("final_response", ""))
+        if hasattr(result_msg, "input_token"):
+            result_msg.input_token = int(result_container.get("input_token", 0))
+        if hasattr(result_msg, "output_token"):
+            result_msg.output_token = int(result_container.get("output_token", 0))
 
         goal_handle.succeed()
         self.get_logger().info(f"[high-level action] Goal finished. success={result_msg.success}")
