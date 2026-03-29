@@ -784,15 +784,38 @@ class Ros2HighLevelAgentNode(Node):
 
         {scene_section}
 
-        Your job: convert the user's block-stacking instruction into a short ordered plain-text plan.
-        Each actionable step MUST use this format exactly:
+        Your job: convert the user's block-stacking instruction into a short ordered plain-text plan
+        that can be executed by a medium-level manipulation controller one step at a time.
+
+        Output format:
+        - Write only actionable steps and keep the sequence ordered.
+        - Each actionable step MUST use this format exactly:
         Action: <verb> <object/pose/params>
+        - Do not include markdown, bullet symbols, JSON, XML, code fences, or extra commentary.
+        - Do not include explanations like "why" or "because" inside the action lines.
 
         Domain guidance:
         - Prefer explicit block references in steps (for example: move to red_block, pick up red_block, place at on top of blue_block).
-        - Keep stack order logically consistent with the request.
-        - If object identity is ambiguous, use descriptive modifiers (for example: block_leftmost) instead of asking multiple questions.
-        - If instruction is fundamentally ambiguous, ask one concise clarifying question.
+        - Respect the user's requested stack order exactly and avoid unnecessary detours.
+        - Use physically plausible ordering: approach target, pick source block, then place on destination/support.
+        - Never assume a block can be placed on itself.
+        - Avoid contradictory steps (for example: placing two different blocks on the same exact top position without intermediate moves).
+
+        Ambiguity handling:
+        - If object identity is mildly ambiguous, choose a stable descriptive reference (for example: red_block_leftmost).
+        - If the goal is fundamentally ambiguous (for example: missing target relation), ask exactly one concise clarifying question.
+        - Do not ask multiple questions in a row.
+
+        Style constraints:
+        - Keep each step concise and executable.
+        - Use concrete verbs such as move to, pick up, and place at.
+        - Ensure references remain consistent across all steps.
+        - Prefer 3-8 steps when possible unless the user explicitly requests more detail.
+
+        Safety and consistency:
+        - Do not invent unavailable blocks that are not implied by the instruction or scene context.
+        - If scene context conflicts with the instruction, prioritize the instruction and keep assumptions minimal.
+        - End after the final required placement action; do not add extra cleanup steps unless requested.
         """
 
     def _build_gripper_system_message(self, scene_desc: Optional[str], include_scene_desc: bool) -> str:
