@@ -795,9 +795,9 @@ class Ros2HighLevelAgentNode(Node):
         - Do not include explanations like "why" or "because" inside the action lines.
 
         Domain guidance:
-        - Prefer explicit block references in steps (for example: move to red_block, pick up red_block, place at on top of blue_block).
+        - Prefer explicit block references in steps (for example: pick up red_block, place at on top of blue_block).
         - Respect the user's requested stack order exactly and avoid unnecessary detours.
-        - Use physically plausible ordering: approach target, pick source block, then place on destination/support.
+        - Use physically plausible ordering: pick source block, then place on destination/support.
         - Never assume a block can be placed on itself.
         - Avoid contradictory steps (for example: placing two different blocks on the same exact top position without intermediate moves).
 
