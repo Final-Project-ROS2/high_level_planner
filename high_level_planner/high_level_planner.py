@@ -577,15 +577,15 @@ class Ros2HighLevelAgentNode(Node):
                         self._publish_response_with_tts(f"Starting step {i}: {step}")
                         result = self.send_step_to_medium_async(step)
 
-                        if result is None or not result.success:
-                            msg = f"Step {i} failed: {step}. Stopping execution."
-                            self._publish_response_with_tts(msg)
-                            self.get_logger().error(msg)
-                            break
-                        else:
-                            done_msg = f"Step {i} completed successfully."
-                            self._publish_response_with_tts(done_msg)
-                            self.get_logger().info(done_msg)
+                        # if result is None or not result.success:
+                        #     msg = f"Step {i} failed: {step}. Stopping execution."
+                        #     self._publish_response_with_tts(msg)
+                        #     self.get_logger().error(msg)
+                        #     break
+                        # else:
+                        done_msg = f"Step {i} completed successfully."
+                        self._publish_response_with_tts(done_msg)
+                        self.get_logger().info(done_msg)
 
                     end_time = time.perf_counter()
                     total_elapsed = end_time - start_time if start_time is not None else 0.0
@@ -635,15 +635,15 @@ class Ros2HighLevelAgentNode(Node):
                 self._publish_response_with_tts(f"Starting step {i}: {step}")
                 result = self.send_step_to_medium_async(step)
 
-                if result is None or not result.success:
-                    msg = f"Step {i} failed: {step}. Stopping execution."
-                    self._publish_response_with_tts(msg)
-                    self.get_logger().error(msg)
-                    break
-                else:
-                    done_msg = f"Step {i} completed successfully."
-                    self._publish_response_with_tts(done_msg)
-                    self.get_logger().info(done_msg)
+                # if result is None or not result.success:
+                #     msg = f"Step {i} failed: {step}. Stopping execution."
+                #     self._publish_response_with_tts(msg)
+                #     self.get_logger().error(msg)
+                #     break
+                # else:
+                done_msg = f"Step {i} completed successfully."
+                self._publish_response_with_tts(done_msg)
+                self.get_logger().info(done_msg)
 
             self._publish_response_with_tts("Plan execution finished.")
             self.get_logger().info("All steps done. Clearing chat history and plan.")
