@@ -24,6 +24,8 @@ from typing import List, Dict, Any, Optional
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.action import ActionServer, ActionClient, CancelResponse, GoalResponse
 
 from std_srvs.srv import SetBool, Trigger
@@ -215,17 +217,20 @@ class Ros2HighLevelAgentNode(Node):
                 temperature=0.0,
             )
 
+        # Callback group
+        self.reentrant_callback_group = ReentrantCallbackGroup()
+
 
         # Subscribe to transcript topic (MUST)
-        self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10)
+        self.transcript_sub = self.create_subscription(String, "/transcript", self.transcript_callback, 10, callback_group=self.reentrant_callback_group)
         self._last_transcript_lock = threading.Lock()
         self._last_transcript: Optional[str] = None
 
         # Action client to medium-level planner (send one step at a time)
-        self.medium_level_client = ActionClient(self, Prompt, "/medium_level")
+        self.medium_level_client = ActionClient(self, Prompt, "/medium_level", callback_group=self.reentrant_callback_group)
 
         # Vision clients
-        self.vision_vqa_client = ActionClient(self, Prompt, "/vqa")
+        self.vision_vqa_client = ActionClient(self, Prompt, "/vqa", callback_group=self.reentrant_callback_group)
 
         # Track tools called (for feedback)
         self._tools_called: List[str] = []
@@ -247,7 +252,7 @@ class Ros2HighLevelAgentNode(Node):
         self.latest_plan: Optional[List[str]] = None
 
         # Create a new service for confirmation
-        self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback)
+        self.confirm_srv = self.create_service(Trigger, "/confirm", self.confirm_service_callback, callback_group=self.reentrant_callback_group)
 
         if self.domain_mode == "blocksworld":
             self.high_level_action_type = PromptSceneToken
@@ -264,6 +269,7 @@ class Ros2HighLevelAgentNode(Node):
             execute_callback=self.execute_callback,
             goal_callback=self.goal_callback,
             cancel_callback=self.cancel_callback,
+            callback_group=self.reentrant_callback_group
         )
 
         self.response_pub = self.create_publisher(String, "/response", 10)
@@ -1064,11 +1070,16 @@ class Ros2HighLevelAgentNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = Ros2HighLevelAgentNode()
+
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         node.get_logger().info("Shutting down Ros2 High-Level Agent Node...")
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
