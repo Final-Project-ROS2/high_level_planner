@@ -805,7 +805,8 @@ class Ros2HighLevelAgentNode(Node):
         - The robot has 3 setpoints: home, ready, and handover.
         - Use these action styles: move to <setpoint>, move <direction>, move to <object>, pick up <object>, place at <location>.
         - Use scene context when useful (for example: pick up screwdriver_leftmost).
-        - If the user instruction is unclear, ask one concise clarifying question instead of generating steps.
+        - If the user instruction reference an object using position (e.g. "second from the left") or color (e.g. "the red one"), use your vqa tool to findout what object the user is referring to
+        - If the user instruction is unclear, try asking vqa first, then if the answer is still unclear, ask one concise clarifying question instead of generating steps.
 
         Tool usage:
         - You may use vqa only when object identity is ambiguous.
